@@ -1,6 +1,6 @@
 import argparse
 from data_fetcher import DataFetcher
-from bt_setup import run_backtest, SmaCross
+from bt_setup import run_backtest, SmaCross, MacdStrategy, ForeignBuyStrategy
 
 def fetch_data(args):
     """Handler for the fetch command."""
@@ -12,11 +12,17 @@ def run_strategy(args):
     """Handler for the backtest command."""
     print(f"Running backtest for {args.stock_id}...")
     
-    # Currently only SmaCross is implemented
-    if args.strategy == 'smacross':
-        run_backtest(args.stock_id, strategy=SmaCross, cash=args.cash)
+    strategies = {
+        'smacross': SmaCross,
+        'macd': MacdStrategy,
+        'foreignbuy': ForeignBuyStrategy
+    }
+    
+    if args.strategy in strategies:
+        strat_class = strategies[args.strategy]
+        run_backtest(args.stock_id, strategy=strat_class, cash=args.cash, plot=args.plot)
     else:
-        print(f"Strategy {args.strategy} not recognized.")
+        print(f"Strategy '{args.strategy}' not recognized. Available strategies: {list(strategies.keys())}")
 
 def main():
     parser = argparse.ArgumentParser(description="Taiwan Financial Market Analysis & Trading System")
@@ -31,8 +37,9 @@ def main():
     # Backtest Command
     backtest_parser = subparsers.add_parser("backtest", help="Run a strategy backtest")
     backtest_parser.add_argument("stock_id", type=str, help="Stock ID (e.g., 2330)")
-    backtest_parser.add_argument("--strategy", type=str, default="smacross", help="Strategy to run (default: smacross)")
+    backtest_parser.add_argument("--strategy", type=str, default="smacross", help="Strategy to run (smacross, macd, foreignbuy)")
     backtest_parser.add_argument("--cash", type=float, default=1000000.0, help="Initial cash for the portfolio")
+    backtest_parser.add_argument("--plot", action="store_true", help="Generate and save backtest plot")
 
     args = parser.parse_args()
 

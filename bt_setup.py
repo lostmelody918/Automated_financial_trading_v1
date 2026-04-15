@@ -5,10 +5,12 @@ from datetime import datetime
 
 class PandasData(bt.feeds.PandasData):
     """
-    Custom Data Feed for Backtrader to consume Pandas DataFrames with FinMind data format.
-    FinMind column names: date, stock_id, Trading_Volume (Volume), Trading_money (Turnover),
-    open (Open), max (High), min (Low), close (Close), spread (Change), Trading_turnover (Transactions)
+    Custom Data Feed for Backtrader to consume Pandas DataFrames with FinMind data format
+    and institutional investor data.
     """
+    
+    # Add custom lines for chip data
+    lines = ('foreign', 'trust', 'dealer',)
     
     params = (
         ('datetime', None),
@@ -17,7 +19,10 @@ class PandasData(bt.feeds.PandasData):
         ('low', 'Low'),
         ('close', 'Close'),
         ('volume', 'Volume'),
-        ('openinterest', -1), # Not available in standard stock data
+        ('openinterest', -1),
+        ('foreign', 'Foreign'), # Match the new columns from data_fetcher
+        ('trust', 'Trust'),
+        ('dealer', 'Dealer'),
     )
 
 class TaiwanStockCommission(bt.CommInfoBase):
@@ -65,7 +70,53 @@ class SmaCross(bt.Strategy):
         elif self.crossover < 0:  # in the market & cross to the downside
             self.close()  # close long position
 
-def run_backtest(stock_id: str, strategy=SmaCross, cash: float = 1000000.0):
+class MacdStrategy(bt.Strategy):
+    """
+    MACD Strategy:
+    Buy when MACD line crosses above Signal line.
+    Sell when MACD line crosses below Signal line.
+    """
+    params = dict(
+        macd1=12,
+        macd2=26,
+        macdsig=9
+    )
+
+    def __init__(self):
+        self.macd = bt.ind.MACD(period_me1=self.p.macd1, period_me2=self.p.macd2, period_signal=self.p.macdsig)
+        self.crossover = bt.ind.CrossOver(self.macd.macd, self.macd.signal)
+
+    def next(self):
+        if not self.position:
+            if self.crossover > 0:
+                self.buy()
+        elif self.crossover < 0:
+            self.close()
+
+class ForeignBuyStrategy(bt.Strategy):
+    """
+    Chip (Institutional) Strategy:
+    Buy when Foreign Investors net buy is positive for 2 consecutive days.
+    Sell when Foreign Investors net sell is negative.
+    """
+    def __init__(self):
+        # We use data.foreign (which is the net buy from our PandasData)
+        self.foreign_net_buy = self.data.foreign
+    
+    def next(self):
+        if len(self) < 2:
+            return # Need at least 2 days of data
+            
+        if not self.position:
+            # Buy if foreign bought today and yesterday
+            if self.foreign_net_buy[0] > 0 and self.foreign_net_buy[-1] > 0:
+                self.buy()
+        else:
+            # Sell if foreign sells
+            if self.foreign_net_buy[0] < 0:
+                self.close()
+
+def run_backtest(stock_id: str, strategy=SmaCross, cash: float = 1000000.0, plot: bool = False):
     """
     Runs a backtest for a specific stock using data from the local database.
     """
@@ -104,7 +155,6 @@ def run_backtest(stock_id: str, strategy=SmaCross, cash: float = 1000000.0):
     cerebro.broker.addcommissioninfo(comminfo)
     
     # Add sizers (how many shares to buy)
-    # Taiwan stocks are traded in lots of 1000 shares (or odd lots). Let's use 1000 for simplicity.
     cerebro.addsizer(bt.sizers.SizerFix, stake=1000)
 
     # Analyzers
@@ -126,9 +176,16 @@ def run_backtest(stock_id: str, strategy=SmaCross, cash: float = 1000000.0):
     print('Sharpe Ratio:', strat.analyzers.sharpe.get_analysis().get('sharperatio', 'N/A'))
     print('Max Drawdown:', strat.analyzers.drawdown.get_analysis().get('max', {}).get('drawdown', 'N/A'))
     
-    # Plot results
-    # cerebro.plot(style='candlestick')
+    if plot:
+        # Save plot to an HTML file to avoid matplotlib blocking UI and errors
+        try:
+            import matplotlib
+            matplotlib.use('Agg') # Use non-interactive backend
+            fig = cerebro.plot(style='candlestick')[0][0]
+            fig.savefig(f"backtest_{stock_id}_plot.png", dpi=300)
+            print(f"Plot saved to backtest_{stock_id}_plot.png")
+        except Exception as e:
+            print(f"Plotting failed: {e}")
 
 if __name__ == '__main__':
-    # You would normally run data_fetcher.py first to populate the DB
     run_backtest('2330')
