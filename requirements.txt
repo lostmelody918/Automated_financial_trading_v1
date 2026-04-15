@@ -1,0 +1,10 @@
+pandas
+numpy
+pandas-ta
+backtrader
+FinMind
+SQLAlchemy
+scikit-learn
+matplotlib
+plotly
+mplfinance
