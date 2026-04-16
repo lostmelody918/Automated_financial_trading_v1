@@ -95,6 +95,102 @@ class DataFetcher:
             print(f"Error fetching data for {stock_id}: {e}")
             return pd.DataFrame()
 
+    def fetch_stock_info(self):
+        """Fetches the list of all Taiwan stocks including their industry categories."""
+        print("Fetching Taiwan stock information and industry categories...")
+        try:
+            df = self.dl.taiwan_stock_info()
+            if not df.empty:
+                self.db.save_dataframe(df, "taiwan_stock_info", if_exists='replace')
+                return df
+            return pd.DataFrame()
+        except Exception as e:
+            print(f"Error fetching stock info: {e}")
+            return pd.DataFrame()
+
+    def fetch_realtime_tick(self, stock_id: str):
+        """Fetches the latest tick data for a specific stock."""
+        # Simulated real-time fetch using FinMind's daily data for the current date
+        # In a real scenario, this would call a real-time API or WebSocket
+        try:
+            df = self.dl.taiwan_stock_daily(
+                stock_id=stock_id,
+                start_date=datetime.today().strftime('%Y-%m-%d')
+            )
+            return df.tail(1) if not df.empty else pd.DataFrame()
+        except Exception as e:
+            print(f"Error fetching realtime tick for {stock_id}: {e}")
+            return pd.DataFrame()
+
+    def fetch_stock_financials(self, stock_id: str, start_date: str):
+        """抓取損益表與股利資料，並確保獲得最新一季的完整資訊。"""
+        print(f"Fetching latest financial data for {stock_id}...")
+        results = {"financials": pd.DataFrame(), "dividends": pd.DataFrame(), "error": None}
+
+        if stock_id == "TAIEX":
+            results["error"] = "大盤指數無基本面資料。"
+            return results
+
+        try:
+            # 1. Financial Statement - 強制抓取最近 5 年的資料以確保包含最新季度
+            df_fin = self.dl.taiwan_stock_financial_statement(
+                stock_id=stock_id,
+                start_date="2019-01-01" # 拉長範圍確保資料完整
+            )
+            if df_fin is not None and not df_fin.empty:
+                df_fin = df_fin.sort_values(['date', 'type'], ascending=[False, True])
+                self.db.save_dataframe(df_fin, f"stock_{stock_id}_financials", if_exists='replace')
+                results["financials"] = df_fin
+
+            # 2. Dividend Data
+            df_div = self.dl.taiwan_stock_dividend(stock_id=stock_id, start_date=start_date)
+            if df_div is not None and not df_div.empty:
+                results["dividends"] = df_div
+
+            return results
+        except Exception as e:
+            results["error"] = f"API 抓取異常: {str(e)}"
+            return results
+
+
+    def fetch_stock_chips(self, stock_id: str, start_date: str, end_date: str = None):
+        """抓取籌碼面資訊：資券變化、大戶持股比例"""
+        if not end_date:
+            end_date = datetime.today().strftime('%Y-%m-%d')
+        print(f"Fetching chip data for {stock_id}...")
+        
+        try:
+            # 1. 融資融券
+            df_margin = self.dl.taiwan_stock_margin_purchase_short_sale(
+                stock_id=stock_id, start_date=start_date, end_date=end_date
+            )
+            # 2. 大戶持股比例 (每週)
+            df_holding = self.dl.taiwan_stock_holding_shares_per(
+                stock_id=stock_id, start_date=start_date, end_date=end_date
+            )
+            
+            if not df_margin.empty:
+                self.db.save_dataframe(df_margin, f"stock_{stock_id}_margin", if_exists='replace')
+            if not df_holding.empty:
+                self.db.save_dataframe(df_holding, f"stock_{stock_id}_holdings", if_exists='replace')
+                
+            return {"margin": df_margin, "holdings": df_holding}
+        except Exception as e:
+            print(f"Error fetching chips: {e}")
+            return {"margin": pd.DataFrame(), "holdings": pd.DataFrame()}
+
+    def fetch_industry_prices(self, stock_ids: list, start_date: str, end_date: str):
+        """Fetches daily prices for multiple stocks to calculate correlation."""
+        combined_data = {}
+        for sid in stock_ids:
+            try:
+                df = self.dl.taiwan_stock_daily(stock_id=sid, start_date=start_date, end_date=end_date)
+                if not df.empty:
+                    combined_data[sid] = df.set_index('date')['close']
+            except:
+                continue
+        return pd.DataFrame(combined_data)
+
 if __name__ == "__main__":
     fetcher = DataFetcher()
     # Let's fetch TSMC (2330) data from 2020-01-01 to today as a test

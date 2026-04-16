@@ -1,191 +1,152 @@
 import backtrader as bt
 import pandas as pd
+import numpy as np
 from database import DatabaseManager
 from datetime import datetime
+import matplotlib
+matplotlib.use('Agg') # 安全模式：不開啟任何視窗，專注於輸出圖片
+import mplfinance as mpf
 
 class PandasData(bt.feeds.PandasData):
-    """
-    Custom Data Feed for Backtrader to consume Pandas DataFrames with FinMind data format
-    and institutional investor data.
-    """
-    
-    # Add custom lines for chip data
     lines = ('foreign', 'trust', 'dealer',)
-    
     params = (
-        ('datetime', None),
-        ('open', 'Open'),
-        ('high', 'High'),
-        ('low', 'Low'),
-        ('close', 'Close'),
-        ('volume', 'Volume'),
-        ('openinterest', -1),
-        ('foreign', 'Foreign'), # Match the new columns from data_fetcher
-        ('trust', 'Trust'),
-        ('dealer', 'Dealer'),
+        ('datetime', None), ('open', 'Open'), ('high', 'High'),
+        ('low', 'Low'), ('close', 'Close'), ('volume', 'Volume'),
+        ('openinterest', -1), ('foreign', 'Foreign'),
+        ('trust', 'Trust'), ('dealer', 'Dealer'),
     )
 
 class TaiwanStockCommission(bt.CommInfoBase):
-    """
-    Custom commission scheme for Taiwan Stock Market.
-    - Commission: 0.1425% (usually discounted, but using standard here)
-    - Tax: 0.3% on sell only (stock transaction tax)
-    """
-    params = (
-        ('commission', 0.001425),
-        ('tax', 0.003),
-        ('stocklike', True),
-        ('commtype', bt.CommInfoBase.COMM_PERC),
-    )
-
+    params = (('commission', 0.001425), ('tax', 0.003), ('stocklike', True), ('commtype', bt.CommInfoBase.COMM_PERC))
     def _getcommission(self, size, price, pseudoexec):
-        """
-        Calculate commission. If selling, add transaction tax.
-        """
         comm = size * price * self.p.commission
-        if size < 0: # Selling
-            tax = abs(size) * price * self.p.tax
-            comm += tax
+        if size < 0: comm += abs(size) * price * self.p.tax
         return comm
 
 class SmaCross(bt.Strategy):
-    """
-    A simple Moving Average Crossover strategy for testing.
-    Buys when fast SMA crosses over slow SMA, sells when it crosses under.
-    """
-    params = dict(
-        pfast=10,  # period for the fast moving average
-        pslow=30   # period for the slow moving average
-    )
-
+    params = dict(pfast=10, pslow=30)
     def __init__(self):
-        sma1 = bt.ind.SMA(period=self.p.pfast)  # fast moving average
-        sma2 = bt.ind.SMA(period=self.p.pslow)  # slow moving average
-        self.crossover = bt.ind.CrossOver(sma1, sma2)  # crossover signal
-
+        self.crossover = bt.ind.CrossOver(bt.ind.SMA(period=self.p.pfast), bt.ind.SMA(period=self.p.pslow))
     def next(self):
-        if not self.position:  # not in the market
-            if self.crossover > 0:  # if fast crosses slow to the upside
-                self.buy()  # enter long
-        elif self.crossover < 0:  # in the market & cross to the downside
-            self.close()  # close long position
+        if not self.position and self.crossover > 0: self.buy()
+        elif self.crossover < 0: self.close()
 
 class MacdStrategy(bt.Strategy):
-    """
-    MACD Strategy:
-    Buy when MACD line crosses above Signal line.
-    Sell when MACD line crosses below Signal line.
-    """
-    params = dict(
-        macd1=12,
-        macd2=26,
-        macdsig=9
-    )
-
+    params = dict(macd1=12, macd2=26, macdsig=9)
     def __init__(self):
         self.macd = bt.ind.MACD(period_me1=self.p.macd1, period_me2=self.p.macd2, period_signal=self.p.macdsig)
         self.crossover = bt.ind.CrossOver(self.macd.macd, self.macd.signal)
-
     def next(self):
-        if not self.position:
-            if self.crossover > 0:
-                self.buy()
-        elif self.crossover < 0:
-            self.close()
+        if not self.position and self.crossover > 0: self.buy()
+        elif self.crossover < 0: self.close()
 
 class ForeignBuyStrategy(bt.Strategy):
-    """
-    Chip (Institutional) Strategy:
-    Buy when Foreign Investors net buy is positive for 2 consecutive days.
-    Sell when Foreign Investors net sell is negative.
-    """
-    def __init__(self):
-        # We use data.foreign (which is the net buy from our PandasData)
-        self.foreign_net_buy = self.data.foreign
-    
+    def __init__(self): self.foreign = self.data.foreign
     def next(self):
-        if len(self) < 2:
-            return # Need at least 2 days of data
-            
-        if not self.position:
-            # Buy if foreign bought today and yesterday
-            if self.foreign_net_buy[0] > 0 and self.foreign_net_buy[-1] > 0:
-                self.buy()
-        else:
-            # Sell if foreign sells
-            if self.foreign_net_buy[0] < 0:
-                self.close()
+        if len(self) < 2: return
+        if not self.position and self.foreign[0] > 0 and self.foreign[-1] > 0: self.buy()
+        elif self.position and self.foreign[0] < 0: self.close()
+
+class RsiStrategy(bt.Strategy):
+    params = dict(period=14, low=30, high=70)
+    def __init__(self): self.rsi = bt.ind.RSI(period=self.p.period)
+    def next(self):
+        if not self.position and self.rsi < self.p.low: self.buy()
+        elif self.position and self.rsi > self.p.high: self.close()
 
 def run_backtest(stock_id: str, strategy=SmaCross, cash: float = 1000000.0, plot: bool = False):
-    """
-    Runs a backtest for a specific stock using data from the local database.
-    """
     db = DatabaseManager()
-    table_name = f"stock_{stock_id}_daily"
+    df = db.load_dataframe(f"stock_{stock_id}_daily")
+    if df.empty: return {"error": f"找不到 {stock_id} 資料。"}
     
-    print(f"Loading data for {stock_id} from database...")
-    df = db.load_dataframe(table_name)
-    
-    if df.empty:
-        print(f"No data found for {stock_id} in the database. Please fetch it first.")
-        return
-        
-    # Data preprocessing
     df['date'] = pd.to_datetime(df['date'])
     df.set_index('date', inplace=True)
     df.sort_index(inplace=True)
+    df = df.ffill().fillna(0) # 徹底清除空值
     
-    print(f"Data loaded: {len(df)} rows. Starting backtest...")
-    
-    # Initialize Cerebro engine
     cerebro = bt.Cerebro()
-
-    # Add data feed
-    data = PandasData(dataname=df)
-    cerebro.adddata(data)
-
-    # Add strategy
+    cerebro.adddata(PandasData(dataname=df))
     cerebro.addstrategy(strategy)
-
-    # Set broker settings (initial cash)
     cerebro.broker.setcash(cash)
-
-    # Add Taiwan stock commission and tax
-    comminfo = TaiwanStockCommission()
-    cerebro.broker.addcommissioninfo(comminfo)
-    
-    # Add sizers (how many shares to buy)
+    cerebro.broker.addcommissioninfo(TaiwanStockCommission())
     cerebro.addsizer(bt.sizers.SizerFix, stake=1000)
-
-    # Analyzers
+    
     cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe')
     cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
-    cerebro.addanalyzer(bt.analyzers.Returns, _name='returns')
+    cerebro.addanalyzer(bt.analyzers.TimeReturn, _name='timereturn')
+    cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name='trade')
+    cerebro.addanalyzer(bt.analyzers.SQN, _name='sqn')
 
-    # Run Cerebro
-    initial_value = cerebro.broker.getvalue()
-    print(f'Starting Portfolio Value: {initial_value:.2f}')
-    
     results = cerebro.run()
     strat = results[0]
     
-    final_value = cerebro.broker.getvalue()
-    print(f'Final Portfolio Value: {final_value:.2f}')
-    print(f'Return: {(final_value - initial_value) / initial_value * 100:.2f}%')
+    final_val = cerebro.broker.getvalue()
+    ret_pct = (final_val - cash) / cash * 100
+    sharpe = strat.analyzers.sharpe.get_analysis().get('sharperatio', None)
+    max_dd = strat.analyzers.drawdown.get_analysis().get('max', {}).get('drawdown', None)
     
-    print('Sharpe Ratio:', strat.analyzers.sharpe.get_analysis().get('sharperatio', 'N/A'))
-    print('Max Drawdown:', strat.analyzers.drawdown.get_analysis().get('max', {}).get('drawdown', 'N/A'))
-    
-    if plot:
-        # Save plot to an HTML file to avoid matplotlib blocking UI and errors
-        try:
-            import matplotlib
-            matplotlib.use('Agg') # Use non-interactive backend
-            fig = cerebro.plot(style='candlestick')[0][0]
-            fig.savefig(f"backtest_{stock_id}_plot.png", dpi=300)
-            print(f"Plot saved to backtest_{stock_id}_plot.png")
-        except Exception as e:
-            print(f"Plotting failed: {e}")
+    # New metrics
+    trade_analysis = strat.analyzers.trade.get_analysis()
+    total_trades = trade_analysis.total.total if 'total' in trade_analysis else 0
+    win_rate = (trade_analysis.won.total / total_trades * 100) if total_trades > 0 else 0
+    sqn = strat.analyzers.sqn.get_analysis().get('sqn', 0)
 
-if __name__ == '__main__':
-    run_backtest('2330')
+    timerets = pd.Series(strat.analyzers.timereturn.get_analysis())
+    std_dev = timerets.std() * (252**0.5) * 100 if not timerets.empty else None
+    
+    beta = "N/A"
+    try:
+        taiex_df = db.load_dataframe("stock_TAIEX_daily")
+        if not taiex_df.empty and stock_id != "TAIEX":
+            taiex_df['date'] = pd.to_datetime(taiex_df['date'])
+            taiex_df.set_index('date', inplace=True)
+            taiex_rets = taiex_df['Close'].pct_change()
+            combined = pd.concat([timerets, taiex_rets], axis=1).dropna()
+            if len(combined) > 5:
+                beta = np.cov(combined.iloc[:, 0], combined.iloc[:, 1])[0, 1] / np.var(combined.iloc[:, 1])
+    except: pass
+
+    plot_file = None
+    plot_error = None
+    if plot:
+        try:
+            # 不再使用 .tail(200)，直接使用所有資料以對齊開始結束日期
+            plot_df = df.copy() 
+            add_plots = []
+            if strategy == SmaCross:
+                add_plots.append(mpf.make_addplot(plot_df['Close'].rolling(10).mean(), color='blue'))
+                add_plots.append(mpf.make_addplot(plot_df['Close'].rolling(30).mean(), color='orange'))
+            elif strategy == MacdStrategy:
+                exp1 = plot_df['Close'].ewm(span=12).mean()
+                exp2 = plot_df['Close'].ewm(span=26).mean()
+                macd = exp1 - exp2
+                signal = macd.ewm(span=9).mean()
+                add_plots.append(mpf.make_addplot(macd, panel=1, color='fuchsia', ylabel='MACD'))
+                add_plots.append(mpf.make_addplot(signal, panel=1, color='b'))
+            elif strategy == RsiStrategy:
+                delta = plot_df['Close'].diff()
+                up, down = delta.copy(), delta.copy()
+                up[up < 0] = 0; down[down > 0] = 0
+                rsi = 100.0 - (100.0 / (1.0 + up.rolling(14).mean() / (down.abs().rolling(14).mean() + 1e-9)))
+                add_plots.append(mpf.make_addplot(rsi, panel=1, color='blue', ylabel='RSI'))
+            elif strategy == ForeignBuyStrategy:
+                add_plots.append(mpf.make_addplot(plot_df['Foreign'], type='bar', panel=1, color='purple', alpha=0.5))
+
+            mc = mpf.make_marketcolors(up='red', down='green', inherit=True)
+            s = mpf.make_mpf_style(marketcolors=mc, gridstyle=':', y_on_right=False)
+            
+            output_filename = f"backtest_plot_current.png"
+            mpf.plot(plot_df, type='candle', volume=True, addplot=add_plots, style=s, 
+                     savefig=dict(fname=output_filename, dpi=100, bbox_inches='tight'), 
+                     figsize=(10, 6))
+            plot_file = output_filename
+        except Exception as e:
+            plot_error = str(e)
+
+    return {
+        "final_value": final_val, "return_pct": ret_pct,
+        "sharpe": sharpe if sharpe else "N/A", "max_drawdown": max_dd if max_dd else "N/A",
+        "std_dev": std_dev if std_dev else "N/A", "beta": beta, 
+        "total_trades": total_trades, "win_rate": win_rate, "sqn": sqn,
+        "plot_file": plot_file, "plot_error": plot_error
+    }
