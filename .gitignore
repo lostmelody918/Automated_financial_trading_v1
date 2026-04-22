@@ -3,3 +3,6 @@ __pycache__/
 *.pyc
 *.db
 .DS_Store
+anue_profile/
+browser_profile/
+node_modules/
