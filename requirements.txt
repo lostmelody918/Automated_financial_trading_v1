@@ -9,3 +9,5 @@ matplotlib
 plotly
 mplfinance
 PyQt6
+playwright
+torch

@@ -84,3 +84,30 @@ class KLineAnalyzer:
         # 加入 KD
         df = KDAnalyzer.calculate_kd(df)
         return df
+
+class SentimentAnalyzer:
+    """提供新聞情緒分析功能"""
+    
+    @staticmethod
+    def analyze_sentiment(news_df: pd.DataFrame):
+        """簡單的新聞標題情緒分析"""
+        if news_df.empty:
+            return 0, pd.DataFrame()
+        
+        pos_keywords = ['獲利', '成長', '創新高', '看好', '買超', '營收增加', '突破', '轉盈', '優於預期', '大漲', '噴發', '看多']
+        neg_keywords = ['虧損', '衰退', '看淡', '賣超', '營收減少', '跌破', '虧損擴大', '調降', '低於預期', '重挫', '大跌', '看空']
+        
+        scores = []
+        for title in news_df['title']:
+            score = 0
+            for k in pos_keywords:
+                if k in title: score += 1
+            for k in neg_keywords:
+                if k in title: score -= 1
+            scores.append(score)
+            
+        news_df = news_df.copy()
+        news_df['sentiment_score'] = scores
+        avg_score = sum(scores) / len(scores) if scores else 0
+        
+        return avg_score, news_df

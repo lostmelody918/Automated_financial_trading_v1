@@ -215,7 +215,7 @@ class MainWindow(QMainWindow):
         self.fin_table.setReadOnly(True)
         basic_layout.addWidget(self.fin_table)
         self.tabs.addTab(self.basic_tab, "股票基本面")
-        
+
         # Tab 5: K 線型態分析
         self.kline_tab = QWidget()
         kline_layout = QVBoxLayout(self.kline_tab)
@@ -233,28 +233,28 @@ class MainWindow(QMainWindow):
         sid = self.stock_id_input.currentText().split(" ")[0]
         self.status_lbl.setText(f"狀態: ⏳ 正在分析 {sid} KD 線型態...")
         QApplication.processEvents()
-        
+
         df = self.db.load_dataframe(f"stock_{sid}_daily")
         if df.empty:
             QMessageBox.warning(self, "警告", "找不到本地資料，請先抓取資料。")
             return
-            
+
         df = df.sort_values('date')
         # 先計算指標
         df = KLineAnalyzer.add_indicators(df)
         # 進行 KD 型態分析
         patterns = KDAnalyzer.analyze_patterns(df)
-        
+
         report = f"--- {sid} KD 指標深度分析報告 ({datetime.now().strftime('%Y-%m-%d')}) ---\n\n"
-        
+
         if patterns:
             report += "【偵測到以下 KD 訊號】:\n" + "\n".join([f"- {p}" for p in patterns])
         else:
             report += "目前無明顯 KD 指標訊號。"
-            
+
         # 加入原理說明
         report += "\n\n" + KDAnalyzer.get_principles()
-            
+
         self.kline_box.setText(report)
         self.status_lbl.setText("狀態: ✅ KD 分析完成")
 
@@ -264,26 +264,35 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "警告", "請先選擇一個特定的產業分類。")
             return
 
-        self.status_lbl.setText("狀態: ⏳ 正在計算熱圖數據...")
+        selected_sid = self.stock_id_input.currentText().split(" ")[0]
+        self.status_lbl.setText(f"狀態: ⏳ 正在計算 {selected_sid} 與 {industry} 產業相關性...")
         QApplication.processEvents()
 
-        stocks = self.stock_info_df[self.stock_info_df['industry_category'] == industry]['stock_id'].tolist()[:8]
+        # 獲取同產業股票，並確保選中的股票在名單中
+        industry_stocks = self.stock_info_df[self.stock_info_df['industry_category'] == industry]['stock_id'].tolist()
+        
+        # 組合名單：選中的股票放在第一位 + 產業內其他前 7 檔股票
+        stocks_to_compare = [selected_sid]
+        for s in industry_stocks:
+            if s != selected_sid and len(stocks_to_compare) < 8:
+                stocks_to_compare.append(s)
+
         start = self.start_date_input.date().toString("yyyy-MM-dd")
         end = self.end_date_input.date().toString("yyyy-MM-dd")
 
-        df_all = self.fetcher.fetch_industry_prices(stocks, start, end)
+        df_all = self.fetcher.fetch_industry_prices(stocks_to_compare, start, end)
         if df_all.empty:
-            self.corr_box.setText("無法獲取資料。")
+            self.corr_box.setText("無法獲取資料。請確認是否已抓取歷史資料。")
             return
 
         corr_matrix = df_all.corr().round(2)
-        
+
         explanation = "【相關性解讀說明】\n"
         explanation += "> 0.7: 強相關 (通常同漲同跌)\n"
         explanation += "0.3~0.7: 中相關\n"
         explanation += "< 0.3: 低相關 (走勢獨立)\n\n"
-        
-        self.corr_box.setText(f"【{industry}】產業相關性矩陣\n\n" + corr_matrix.to_string() + "\n\n" + explanation)
+
+        self.corr_box.setText(f"【{selected_sid} vs {industry}】產業相關性矩陣\n\n" + corr_matrix.to_string() + "\n\n" + explanation)
         self.status_lbl.setText("狀態: ✅ 相關性矩陣已生成")
 
     def do_fetch_financials(self):
@@ -296,29 +305,59 @@ class MainWindow(QMainWindow):
         data = self.fetcher.fetch_stock_financials(sid, start)
         # 籌碼面
         chips = self.fetcher.fetch_stock_chips(sid, start)
-        
+        # 營業比重與地區分佈
+        df_rev = self.fetcher.fetch_revenue_breakdown(sid)
+
         report = f"==== {sid} 深度綜合分析報告 ====\n\n"
-        
-        # 1. 營業比重模擬 (依據行業屬性)
-        report += "[1. 營業比重/獲利來源預估]\n"
-        report += "- 主要產品線 A: 55%\n- 零件與組裝 B: 30%\n- 售後服務與其他: 15%\n"
-        report += "(註：營業比重可協助了解公司核心競爭力)\n\n"
-        
-        # 2. 籌碼面摘要
+
+        # 1. 營業比重 (產品結構)
+        report += "[1. 營業比重 - 產品結構]\n"
+        df_prod = df_rev[df_rev['type'] == '產品結構'] if not df_rev.empty else pd.DataFrame()
+        if not df_prod.empty:
+            year = df_prod.iloc[0]['year']
+            report += f"(資料年份: {year}年)\n"
+            for _, row in df_prod.iterrows():
+                report += f"- {row['name']}: {row['percentage']}%\n"
+        else:
+            report += "⚠️ 沒有資料 (產品結構)\n"
+        report += "\n"
+
+        # 2. 獲利來源 (銷售地區)
+        report += "[2. 獲利來源 - 銷售地區]\n"
+        df_region = df_rev[df_rev['type'] == '銷售地區'] if not df_rev.empty else pd.DataFrame()
+        if not df_region.empty:
+            year = df_region.iloc[0]['year']
+            report += f"(資料年份: {year}年)\n"
+            for _, row in df_region.iterrows():
+                report += f"- {row['name']}: {row['percentage']}%\n"
+        else:
+            report += "⚠️ 沒有資料 (銷售地區)\n"
+        report += "\n"
+
+        # 3. 籌碼面摘要
         df_margin = chips.get("margin")
         if df_margin is not None and not df_margin.empty:
             latest_m = df_margin.iloc[-1]
-            report += "[2. 籌碼面 - 資券變化]\n"
-            report += f"- 最新融資餘額: {latest_m['MarginPurchaseLimit']:,}\n"
-            report += f"- 最新融券餘額: {latest_m['ShortSaleLimit']:,}\n"
-            report += f"- 資券比: {(latest_m['ShortSaleLimit']/latest_m['MarginPurchaseLimit']*100):.2f}%\n\n"
-        
-        # 3. 財務數據摘要
+            report += "[3. 籌碼面 - 資券變化]\n"
+            # 修正: 使用 TodayBalance (當日餘額) 而非 Limit (限額)
+            margin_bal = latest_m.get('MarginPurchaseTodayBalance', 0)
+            short_bal = latest_m.get('ShortSaleTodayBalance', 0)
+            
+            report += f"- 融資餘額: {margin_bal:,}\n"
+            report += f"- 融券餘額: {short_bal:,}\n"
+            
+            if margin_bal > 0:
+                ratio = (short_bal / margin_bal) * 100
+                report += f"- 資券比: {ratio:.2f}%\n\n"
+            else:
+                report += "- 資券比: 0.00% (融資餘額為0)\n\n"
+
+        # 4. 財務數據摘要
         df_fin = data.get("financials", pd.DataFrame())
         if not df_fin.empty:
-            report += "[3. 近期損益表摘要]\n"
+            report += "[4. 近期損益表摘要]\n"
             report += df_fin.head(10).to_string()
-        
+
         self.fin_table.setText(report)
         self.status_lbl.setText(f"狀態: ✅ {sid} 資料分析完成")
 
