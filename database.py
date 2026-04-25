@@ -41,13 +41,19 @@ class DatabaseManager:
             pd.DataFrame: The loaded data.
         """
         try:
+            from sqlalchemy import inspect
+            inspector = inspect(self.engine)
+            if not inspector.has_table(table_name):
+                return pd.DataFrame()
+
             if query:
                 df = pd.read_sql(query, con=self.engine)
             else:
                 df = pd.read_sql_table(table_name, con=self.engine)
             return df
         except Exception as e:
-            print(f"Error loading DataFrame from table '{table_name}': {e}")
+            if "not found" not in str(e).lower() and "no such table" not in str(e).lower():
+                print(f"Error loading DataFrame from table '{table_name}': {e}")
             return pd.DataFrame()
 
 # Example usage (can be removed later)

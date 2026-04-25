@@ -11,3 +11,4 @@ mplfinance
 PyQt6
 playwright
 torch
+yfinance

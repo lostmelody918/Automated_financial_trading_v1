@@ -81,33 +81,131 @@ class KLineAnalyzer:
         df["MA20"] = ta.sma(df["Close"], length=20)
         df["MA60"] = ta.sma(df["Close"], length=60)
         df["RSI"] = ta.rsi(df["Close"], length=14)
+        
+        # 加入 ATR 與 波動率 (ATR / Close)
+        if "High" in df.columns and "Low" in df.columns:
+            atr = ta.atr(df["High"], df["Low"], df["Close"], length=14)
+            if atr is not None:
+                df["ATR"] = atr
+                df["Volatility"] = (df["ATR"] / df["Close"]) * 100
+            else:
+                df["ATR"] = 0.0
+                df["Volatility"] = 0.0
+        
         # 加入 KD
         df = KDAnalyzer.calculate_kd(df)
+        
+        # 加入 1/3/5/15/30 日價格動能 (Momentum)
+        # 動能計算公式: (當前價格 - n日前價格) / n日前價格 * 100
+        def safe_momentum(period):
+            p = min(period, max(1, len(df) - 1))
+            if p > 0:
+                return df["Close"].pct_change(periods=p) * 100
+            return pd.Series([0.0] * len(df), index=df.index)
+
+        df["Momentum_1"] = safe_momentum(1)
+        df["Momentum_3"] = safe_momentum(3)
+        df["Momentum_5"] = safe_momentum(5)
+        df["Momentum_15"] = safe_momentum(15)
+        df["Momentum_30"] = safe_momentum(30)
+        
         return df
 
-class SentimentAnalyzer:
-    """提供新聞情緒分析功能"""
+class MomentumAnalyzer:
+    """提供價格動能指標分析"""
     
     @staticmethod
-    def analyze_sentiment(news_df: pd.DataFrame):
-        """簡單的新聞標題情緒分析"""
-        if news_df.empty:
-            return 0, pd.DataFrame()
-        
-        pos_keywords = ['獲利', '成長', '創新高', '看好', '買超', '營收增加', '突破', '轉盈', '優於預期', '大漲', '噴發', '看多']
-        neg_keywords = ['虧損', '衰退', '看淡', '賣超', '營收減少', '跌破', '虧損擴大', '調降', '低於預期', '重挫', '大跌', '看空']
-        
-        scores = []
-        for title in news_df['title']:
-            score = 0
-            for k in pos_keywords:
-                if k in title: score += 1
-            for k in neg_keywords:
-                if k in title: score -= 1
-            scores.append(score)
+    def analyze_momentum(df: pd.DataFrame):
+        """分析 1/3/5/15/30 日動能狀態"""
+        if "Momentum_1" not in df.columns:
+            df = KLineAnalyzer.add_indicators(df)
             
-        news_df = news_df.copy()
-        news_df['sentiment_score'] = scores
-        avg_score = sum(scores) / len(scores) if scores else 0
+        latest = df.iloc[-1]
+        def safe_get(col):
+            val = latest[col]
+            return val if pd.notna(val) else 0.0
+
+        m1, m3, m5 = safe_get("Momentum_1"), safe_get("Momentum_3"), safe_get("Momentum_5")
+        m15, m30 = safe_get("Momentum_15"), safe_get("Momentum_30")
         
-        return avg_score, news_df
+        status = []
+        # 短期動能
+        if m1 > 0 and m3 > 0 and m5 > 0:
+            status.append("🔥 短期強勁上升動能: 1/3/5 日動能皆為正值。")
+        elif m1 < 0 and m3 < 0 and m5 < 0:
+            status.append("❄️ 短期強勁下跌動能: 1/3/5 日動能皆為負值。")
+            
+        # 中期動能
+        if m15 > 0 and m30 > 0:
+            status.append("📈 中期趨勢向上: 15/30 日動能保持正成長。")
+        elif m15 < 0 and m30 < 0:
+            status.append("📉 中期趨勢向下: 15/30 日動能轉負。")
+        
+        if m1 > 5: status.append("⚡ 極短線暴漲: 單日漲幅超過 5%。")
+        if m1 < -5: status.append("🆘 極短線重挫: 單日跌幅超過 5%。")
+        
+        return {
+            "m1": m1, "m3": m3, "m5": m5, "m15": m15, "m30": m30,
+            "status": status
+        }
+
+class SentimentAnalyzer:
+    """進階新聞情緒分析 - 支援中英文權重評分"""
+    
+    # 權重設定: 2為強烈訊號, 1為一般訊號
+    POS_MAP = {
+        # 中文強烈看多
+        '創新高': 2, '噴發': 2, '大漲': 2, '強勢': 2, '優於預期': 2, '轉盈': 2, '買超': 1,
+        '成長': 1, '看好': 1, '營收增加': 1, '突破': 1, '看多': 1, '獲利': 1, '目標價上調': 2,
+        # 英文強烈看多
+        'bullish': 2, 'soar': 2, 'surge': 2, 'beat': 2, 'outperform': 2, 'buy': 1,
+        'growth': 1, 'positive': 1, 'breakout': 1, 'upgrade': 2, 'gain': 1
+    }
+    
+    NEG_MAP = {
+        # 中文強烈看空
+        '虧損擴大': 2, '重挫': 2, '大跌': 2, '低於預期': 2, '看淡': 1, '賣超': 1,
+        '衰退': 1, '跌破': 1, '調降': 2, '看空': 1, '壓力': 1, '獲利回吐': 1,
+        # 英文強烈看空
+        'bearish': 2, 'plummet': 2, 'crash': 2, 'miss': 2, 'underperform': 2, 'sell': 1,
+        'decline': 1, 'negative': 1, 'breakdown': 1, 'downgrade': 2, 'loss': 1
+    }
+
+    @staticmethod
+    def analyze_sentiment(news_list: list, is_us: bool = False):
+        """分析新聞情緒並回傳評分後的結果"""
+        if not news_list:
+            return 0, []
+        
+        processed_news = []
+        total_score = 0
+        
+        for news in news_list:
+            title = news.get('title', '').lower()
+            score = 0
+            
+            # 匹配正向詞
+            for word, weight in SentimentAnalyzer.POS_MAP.items():
+                if word.lower() in title:
+                    score += weight
+            
+            # 匹配負向詞
+            for word, weight in SentimentAnalyzer.NEG_MAP.items():
+                if word.lower() in title:
+                    score -= weight
+            
+            total_score += score
+            
+            # 判斷標籤
+            label = "🟢 看多" if score > 0 else ("🔴 看空" if score < 0 else "⚪ 中性")
+            
+            processed_news.append({
+                'date': news.get('date', news.get('publisher_time', 'N/A')),
+                'title': news.get('title', '無標題'),
+                'score': score,
+                'label': label,
+                'link': news.get('link', '')
+            })
+            
+        avg_score = total_score / len(news_list)
+        return avg_score, processed_news
