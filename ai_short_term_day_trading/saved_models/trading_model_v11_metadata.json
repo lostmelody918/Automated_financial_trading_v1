@@ -1,0 +1,20 @@
+{
+    "experiment_info": {
+        "version": "v11",
+        "date": "2026-04-29 11:27:22",
+        "model_class": "CompositeDayTradingAI"
+    },
+    "hyperparameters": {
+        "leverage": 50,
+        "position_size": 0.25,
+        "take_profit_pct": 0.5,
+        "stop_loss_pct": -0.25,
+        "input_dim": 32
+    },
+    "performance": {
+        "total_return_pct": 28.5,
+        "avg_weekly_return_pct": 3.49,
+        "total_trades": 97,
+        "missed_opportunities": 154
+    }
+}

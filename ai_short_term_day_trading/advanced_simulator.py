@@ -2,237 +2,276 @@ import pandas as pd
 import numpy as np
 import os
 import matplotlib.pyplot as plt
+import torch
 from data_engine import DayTradingDataEngine
 from strategy_factory import StrategyFactory
-import torch
-import torch.nn as nn
+from composite_ai import CompositeDayTradingAI
+from model_manager import TradingModelManager
 
-def save_dummy_model():
-    """創建一個資料夾保存 AI 模型以備未來調用"""
-    model_dir = "saved_models"
-    os.makedirs(model_dir, exist_ok=True)
-    # 建立一個簡單的線性層作為代表
-    dummy_model = nn.Linear(10, 2)
-    torch.save(dummy_model.state_dict(), os.path.join(model_dir, "options_cnn_transformer_v1.pth"))
-    print(f"💾 模型已儲存至 {model_dir}/options_cnn_transforme存至 {model_dir}/options_cnn_transformer_v1.pth")
+def save_trade_plot(df, entry_idx, exit_idx, trade_type, ret, trade_id, entry_features=None):
+    """助手函數：繪製單筆交易的波段圖，並標註特徵與儲存資料"""
+    try:
+        start_plot_idx = max(0, entry_idx - 10)
+        end_plot_idx = min(len(df)-1, exit_idx + 3)
+        plot_df = df.iloc[start_plot_idx:end_plot_idx+1].copy()
+
+        fig, ax = plt.subplots(figsize=(12, 6))
+        ax.plot(plot_df['date'], plot_df['Close'], color='gray', alpha=0.5, label='Price')
+
+        entry_row = df.iloc[entry_idx]
+        exit_row = df.iloc[exit_idx]
+
+        ax.scatter(entry_row['date'], entry_row['Close'], color='blue', marker='^', s=100, label='Entry')
+        ax.scatter(exit_row['date'], exit_row['Close'], color='red', marker='v', s=100, label='Exit')
+
+        ax.plot([entry_row['date'], exit_row['date']], [entry_row['Close'], exit_row['Close']],
+                 color='green' if ret > 0 else 'red', linestyle='--', alpha=0.6)
+
+        title_str = f"Trade #{trade_id} | Type: {trade_type} | Ret: {ret*100:.2f}%"
+        ax.set_title(title_str)
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        plt.xticks(rotation=45)
+
+        plots_dir = os.path.join(os.path.dirname(__file__), "data_learn", "trade_plots")
+        os.makedirs(plots_dir, exist_ok=True)
+
+        # 在圖表上加上特徵文字
+        if entry_features:
+            feature_text = "\n".join([f"{k}: {v:.4f}" if isinstance(v, float) else f"{k}: {v}" for k, v in entry_features.items() if k != 'entry_date'])
+            plt.gcf().text(0.02, 0.5, feature_text, fontsize=8, bbox=dict(facecolor='white', alpha=0.8))
+
+        filename_base = f"trade_{trade_id:03d}_{trade_type}_{'WIN' if ret > 0 else 'LOSS'}"
+        plt.tight_layout(rect=[0.15, 0, 1, 1]) # 留空間給左側文字
+        plt.savefig(os.path.join(plots_dir, f"{filename_base}.png"))
+        plt.close()
+
+        # 儲存詳細資料成 txt
+        if entry_features:
+            with open(os.path.join(plots_dir, f"{filename_base}.txt"), 'w', encoding='utf-8') as f:
+                f.write(f"Trade ID: {trade_id}\n")
+                f.write(f"Type: {trade_type}\n")
+                f.write(f"Return: {ret*100:.2f}%\n")
+                f.write("-" * 20 + "\n")
+                for k, v in entry_features.items():
+                    f.write(f"{k}: {v}\n")
+    except Exception as e:
+        print(f"Plot saving failed: {e}")
 
 def run_advanced_simulator(initial_capital=100000, days=60):
     engine = DayTradingDataEngine("^TWII")
     df = engine.fetch_intraday_data(days=days)
-    
+
     if df.empty:
         print("沒有數據。")
         return
-        
-    save_dummy_model()
-    
-    strategy_engine = StrategyFactory.get_strategy("composite")
-    
-    # 期權模擬 (買方風險有限，獲利無限)
-    LEVERAGE = 300 # 價外選擇權槓桿
-    SLIPPAGE = 0.0001
-    FEE = 0.00005
-    COST = SLIPPAGE + FEE
 
-    print(f"\n📊 啟動機構級期權買方回測模擬器 (策略: {strategy_engine.name})")
+    # 初始化模型與參數
+    feature_cols = [c for c in df.columns if c not in ['date', 'time', 'date_only', 'day_of_week']]
+    input_dim = len(feature_cols)
+
+    ai_model = CompositeDayTradingAI(input_dim=input_dim, d_model=128, nhead=8, num_layers=3)
+    optimizer = torch.optim.Adam(ai_model.parameters(), lr=0.001)
+    model_manager = TradingModelManager(model_dir=os.path.join(os.path.dirname(__file__), "saved_models"))
+
+    ai_model, optimizer, current_version = model_manager.load_latest_model(ai_model, optimizer)
+    ai_model.eval()
+
+    norm_path = os.path.join(os.path.dirname(__file__), "saved_models", "norm_params.json")
+    if os.path.exists(norm_path):
+        import json
+        with open(norm_path, 'r') as f:
+            norm_params = json.load(f)
+        mean_v = np.array([norm_params['mean'][c] for c in norm_params['feature_cols']])
+        std_v = np.array([norm_params['std'][c] for c in norm_params['feature_cols']])
+    else:
+        mean_v, std_v = 0, 1
+
+    strategy_engine = StrategyFactory.get_strategy("composite")
+
+    # 狙擊手模式：黃金槓桿與資金管控
+    LEVERAGE = 300 
+    BASE_SLIPPAGE = 0.001 
+    FEE = 0.00005
+    MAX_POSITION_CAPITAL = 4000000 
+
+    def get_dynamic_cost(capital_amount):
+        impact = (capital_amount / 1000000) * 0.002
+        return BASE_SLIPPAGE + impact + FEE
+
+    print(f"\n📊 啟動【狙擊手模式】AI 突破推理 & 交易波段自動繪圖模擬器")
     print(f"💵 初始本金: NT$ {initial_capital:,} | 槓桿設定: {LEVERAGE} 倍")
-    print(f"📅 涵蓋了交割日 (星期三) 與連假前後效應特徵")
-    print(f"🛡️ 風險限制：選擇權買方單筆最大損失不超過投入本金 (Premium)")
 
     trade_log = []
-    missed_ops = [] 
-
     position = 0
     entry_price = 0
     entry_idx = 0
+    current_entry_features = {} # 新增：暫存當下部位的進場特徵
     current_capital = initial_capital
     capital_curve = [initial_capital]
 
-    # 風控參數
-    TAKE_PROFIT_PCT = 4.00 # 賺 400% 停利 (抓極端轉折)
-    STOP_LOSS_PCT = -0.60  # 賠 60% 停損
-    
-    for i in range(20, len(df)-1):
+    # 一波流停利 (給予更大空間避免被雜訊洗出場，專注在勝率)
+    TAKE_PROFIT_PCT = 1.00  # 指數變動 1.0%
+    STOP_LOSS_PCT = -0.50   # 指數變動 -0.5% (容忍隔夜跳空)
+    WINDOW_SIZE = 40
+
+    for i in range(WINDOW_SIZE, len(df)-1):
         curr_slice = df.iloc[:i+1]
         last_row = curr_slice.iloc[-1]
         next_row = df.iloc[i+1]
-
         curr_time = last_row['date'].time()
-        today_date = last_row['date'].date()
 
-        today_trades = [t for t in trade_log if t['date'].date() == today_date]
+        # AI 推理
+        feat_data = curr_slice[norm_params['feature_cols']].tail(WINDOW_SIZE).values
+        feat_normalized = (feat_data - mean_v) / std_v
+        feat_tensor = torch.tensor(feat_normalized, dtype=torch.float32).unsqueeze(0)
+        with torch.no_grad():
+            logits = ai_model(feat_tensor)
+            probs = torch.softmax(logits, dim=1).squeeze().cpu().numpy()
 
-        # 每天最多只做 3 筆單
-        if len(today_trades) >= 3: 
-            capital_curve.append(current_capital)
-            continue
+        # 資金管理：留倉有隔夜風險，將單筆部位壓在 40% 本金
+        pos_size_pct = 0.40 
 
-        can_trade = (curr_time.hour == 9) or (curr_time.hour == 10) or (curr_time.hour == 11) or (curr_time.hour == 12)
+        trade_capital = min(current_capital * pos_size_pct, MAX_POSITION_CAPITAL)
+        COST = get_dynamic_cost(trade_capital)
 
-        # 資金控管：大幅提高勝率後，可將每次投入資金提升至 45%，搭配複利效應達成 70% 暴利目標
-        POSITION_SIZE = 0.45
-        
-        if curr_time.hour == 13 and curr_time.minute >= 25:
-            if position != 0:
+        # 1. 平倉邏輯
+        # 不限制當日平倉，但最晚必須在「進場的下一個交易日」收盤前強制平倉
+        if position != 0:
+            is_next_day = next_row['date_only'] > current_entry_features['entry_date'].date()
+            if is_next_day and curr_time.hour == 13 and curr_time.minute >= 25:
                 ret = (next_row['Open'] - entry_price) / entry_price if position == 1 else (entry_price - next_row['Open']) / entry_price
                 net_ret = ret * LEVERAGE - COST
-                # 選擇權買方最多虧損 100% 權利金
-                net_ret = max(net_ret, -1.0)
-                
-                trade_capital = current_capital * POSITION_SIZE
-                profit_amt = trade_capital * net_ret
-                current_capital += profit_amt
-                trade_log.append({'date': next_row['date'], 'type': 'Close_EOD', 'ret': net_ret, 'profit_amt': profit_amt, 'capital': current_capital, 'is_wed': last_row['is_settlement_day']})
+                current_capital += trade_capital * net_ret
+                trade_log.append({'date': next_row['date'], 'type': 'Close_Next_Day_EOD', 'ret': net_ret, 'capital': current_capital, 'entry_features': current_entry_features})
+                save_trade_plot(df, entry_idx, i+1, 'Close_Next_Day_EOD', net_ret, len(trade_log), current_entry_features)
                 position = 0
-            capital_curve.append(current_capital)
-            continue
-            
+                capital_curve.append(current_capital)
+                continue
+
         if position != 0:
             high_ret = (next_row['High'] - entry_price) / entry_price if position == 1 else (entry_price - next_row['Low']) / entry_price
             low_ret = (next_row['Low'] - entry_price) / entry_price if position == 1 else (entry_price - next_row['High']) / entry_price
-            
-            lev_high_ret = high_ret * LEVERAGE
-            lev_low_ret = low_ret * LEVERAGE
-            
-            trade_capital = current_capital * POSITION_SIZE
-            
-            if lev_high_ret >= TAKE_PROFIT_PCT:
+
+            if high_ret * LEVERAGE >= TAKE_PROFIT_PCT:
                 net_ret = TAKE_PROFIT_PCT - COST
-                profit_amt = trade_capital * net_ret
-                current_capital += profit_amt
-                trade_log.append({'date': next_row['date'], 'type': 'Take_Profit', 'ret': net_ret, 'profit_amt': profit_amt, 'capital': current_capital, 'is_wed': last_row['is_settlement_day']})
+                current_capital += trade_capital * net_ret
+                trade_log.append({'date': next_row['date'], 'type': 'Take_Profit', 'ret': net_ret, 'capital': current_capital, 'entry_features': current_entry_features})
+                save_trade_plot(df, entry_idx, i+1, 'Take_Profit', net_ret, len(trade_log), current_entry_features)
                 position = 0
                 capital_curve.append(current_capital)
                 continue
-            elif lev_low_ret <= STOP_LOSS_PCT:
-                net_ret = STOP_LOSS_PCT - COST
-                net_ret = max(net_ret, -1.0)
-                profit_amt = trade_capital * net_ret
-                current_capital += profit_amt
-                trade_log.append({'date': next_row['date'], 'type': 'Stop_Loss', 'ret': net_ret, 'profit_amt': profit_amt, 'capital': current_capital, 'is_wed': last_row['is_settlement_day']})
+            elif low_ret * LEVERAGE <= STOP_LOSS_PCT:
+                net_ret = max(STOP_LOSS_PCT - COST, -1.0)
+                current_capital += trade_capital * net_ret
+                trade_log.append({'date': next_row['date'], 'type': 'Stop_Loss', 'ret': net_ret, 'capital': current_capital, 'entry_features': current_entry_features})
+                save_trade_plot(df, entry_idx, i+1, 'Stop_Loss', net_ret, len(trade_log), current_entry_features)
                 position = 0
                 capital_curve.append(current_capital)
                 continue
-                
+
         capital_curve.append(current_capital)
-            
-        if not can_trade:
+
+        # 2. 進場邏輯
+        # 開放全時段進場，以捕捉尾盤跳空機會
+        # 但不能在換日強制平倉的那一刻同時進場
+        can_trade = True 
+        
+        # [修改] 放寬濾網以增加出手次數：有擠壓「或」有波動率就可考慮
+        is_squeeze = last_row.get('is_squeeze', 0)
+        has_vol = last_row['atr'] > df['atr'].rolling(100).mean().iloc[i] * 0.7
+
+        # 如果兩者都沒有，才過濾
+        if not is_squeeze and not has_vol:
             continue
-            
-        # 模擬已訓練完成的複合 AI 模型 (CNN-Transformer) 預測結果
-        # 假設該模型在經過 4 年數據訓練後，對下一個 5 分鐘 K 線的勝率達 88%
-        actual_move = df['Close'].iloc[i+1] - last_row['Close']
-        if np.random.rand() < 0.88:
-            sim_ai = 1.0 if actual_move > 0 else -1.0 
-        else:
-            sim_ai = 1.0 if actual_move <= 0 else -1.0
-        
-        signal = strategy_engine.generate_signal(curr_slice, ai_score=sim_ai)
-        
-        # --- 紀錄漏掉的波段 (Missed Opportunity) ---
-        if signal == 0:
-            # 檢查未來 1 小時 (12 根 K 棒) 的最大漲跌幅
-            future_window = df['Close'].iloc[i+1:i+13]
-            if len(future_window) > 0:
-                max_price = future_window.max()
-                min_price = future_window.min()
-                max_up = (max_price - last_row['Close']) / last_row['Close']
-                max_down = (last_row['Close'] - min_price) / last_row['Close']
-                
-                # 如果未來 1 小時有超過 0.5% 的波動 (乘以槓桿就是 75% 利潤)，但系統沒抓到
-                if max_up > 0.005 or max_down > 0.005:
-                    missed_ops.append({
-                        'date': last_row['date'],
-                        'missed_move': max_up if max_up > max_down else -max_down,
-                        'reason': '策略過於保守未觸發'
-                    })
-        # ----------------------------------------
-        
-        if signal == 1 and position == 0:
-            position = 1
+
+        signal = strategy_engine.generate_signal(curr_slice, ai_score=probs)
+        if signal != 0 and position == 0 and can_trade:
+            position = signal
             entry_price = next_row['Open']
-        elif signal == -1 and position == 0:
-            position = -1
-            entry_price = next_row['Open']
-            
+            entry_idx = i + 1
+
+            # [新增] 紀錄進場當下的特徵
+            current_entry_features = {
+                'entry_date': next_row['date'],
+                'signal': signal,
+                'prob_down': probs[0],
+                'prob_neutral': probs[1],
+                'prob_up': probs[2],
+                'atr': last_row['atr'],
+                'macd_hist': last_row['macd_hist'],
+                'rsi': last_row['rsi'],
+                'vwap_bias': last_row['vwap_bias'],
+                'is_squeeze': is_squeeze,
+                'n225_ret': last_row.get('n225_ret', 0),
+                'n225_slope_5': last_row.get('n225_slope_5', 0),
+                'tsm_ret_1d': last_row.get('tsm_ret_1d', 0),
+                'vix_ret_1d': last_row.get('vix_ret_1d', 0),
+                'ixic_ret_1d': last_row.get('ixic_ret_1d', 0)
+            }
+
+    # 結算
     df_trades = pd.DataFrame(trade_log)
-    df_missed = pd.DataFrame(missed_ops)
-    
-    # 確保輸出目錄存在
-    out_dir = os.path.join(os.path.dirname(__file__), "data_learn")
-    os.makedirs(out_dir, exist_ok=True)
-    
     if df_trades.empty:
-        print("沒有觸發任何交易，策略邏輯可能失效。")
+        print("沒有交易次數")
         return
-        
+
+    # [新增] 儲存交易特徵日誌
+    features_log = []
+    for t in trade_log:
+        if 'entry_features' in t:
+            feat = t['entry_features'].copy()
+            feat['exit_date'] = t['date']
+            feat['trade_type'] = t['type']
+            feat['ret'] = t['ret']
+            features_log.append(feat)
+
+    if features_log:
+        df_features = pd.DataFrame(features_log)
+        out_dir = os.path.join(os.path.dirname(__file__), "data_learn")
+        df_features.to_csv(os.path.join(out_dir, "trade_features_log.csv"), index=False, encoding="utf-8-sig")
+        print(f"💾 已儲存交易特徵日誌至 data_learn/trade_features_log.csv (共 {len(df_features)} 筆)")
+
+    # 計算週報酬率
     df_trades['week'] = df_trades['date'].dt.isocalendar().week
-    
-    # 真實每週資金回報率 (基於本金變化)
     weekly_true_ret = {}
-    weekly_profit = {}
+    weekly_log = []
     last_week_capital = initial_capital
-    
     for week, group in df_trades.groupby('week'):
         week_end_capital = group['capital'].iloc[-1]
-        week_ret = (week_end_capital - last_week_capital) / last_week_capital
-        weekly_true_ret[week] = week_ret
-        weekly_profit[week] = group['profit_amt'].sum()
+        ret = (week_end_capital - last_week_capital) / last_week_capital
+        weekly_true_ret[week] = ret
+        weekly_log.append({
+            'Week': week,
+            'End_Capital': week_end_capital,
+            'Weekly_Return_%': ret * 100,
+            'Weekly_Profit': week_end_capital - last_week_capital
+        })
         last_week_capital = week_end_capital
-        
-    weekly_perf_series = pd.Series(weekly_true_ret)
-    avg_weekly_ret = weekly_perf_series.mean()
-    
+
+    # 儲存每週績效
+    if weekly_log:
+        df_weekly = pd.DataFrame(weekly_log)
+        df_weekly.to_csv(os.path.join(out_dir, "weekly_summary.csv"), index=False, encoding="utf-8-sig")
+        print(f"💾 已儲存每週報酬報告至 data_learn/weekly_summary.csv")
+
+    avg_weekly_ret = pd.Series(weekly_true_ret).mean()
     total_ret = (current_capital - initial_capital) / initial_capital
-    best_trade = df_trades.loc[df_trades['ret'].idxmax()]
-    worst_trade = df_trades.loc[df_trades['ret'].idxmin()]
-    
+
     print("\n" + "="*50)
-    print(f"🚀 --- 期權當沖模擬器結算報告 (目標: >70%/週) ---")
-    print(f"初始本金: NT$ {initial_capital:,}  ->  期末本金: NT$ {int(current_capital):,}")
-    print(f"總交易次數: {len(df_trades)}")
-    print(f"累積真實淨報酬率: {total_ret*100:.2f}% (含複利)")
+    print(f"🚀 --- 終極期權當沖模擬器結算報告 ---")
+    print(f"累積真實淨報酬率: {total_ret*100:.2f}%")
     print(f"真實平均每週報酬: {avg_weekly_ret*100:.2f}%")
-    print(f"錯失大波段次數: {len(missed_ops)} 次 (已紀錄至 CSV 作為 AI 優化依據)")
-    
-    if avg_weekly_ret < 0.70:
-        print("⚠️ 未達每週 70% 極限目標，將自動啟動下一輪優化！")
-    else:
-        print("✅ 達成每週 70% 終極暴利目標！")
-        
-    print("\n🌟 最佳出手 (Best Trade):")
-    is_wed = " (結算日效應)" if best_trade['is_wed'] else ""
-    print(f"時間: {best_trade['date']}{is_wed}, 類型: {best_trade['type']}, 獲利: {best_trade['ret']*100:.2f}% (NT$ {int(best_trade['profit_amt']):,})")
-    
-    print("\n💀 最壞出手 (Worst Trade):")
-    print(f"時間: {worst_trade['date']}, 類型: {worst_trade['type']}, 虧損: {worst_trade['ret']*100:.2f}% (NT$ {int(worst_trade['profit_amt']):,})")
+    print(f"總交易次數: {len(df_trades)} | 勝率: {(df_trades['ret']>0).mean()*100:.2f}%")
     print("="*50)
+    print(f"\n✅ 回測完成！交易波段圖已儲存至 data_learn/trade_plots/")
 
-    # 輸出資料至 data_learn
-    df_trades.to_csv(os.path.join(out_dir, "trade_log.csv"), index=False)
-    if not df_missed.empty:
-        df_missed.to_csv(os.path.join(out_dir, "missed_opportunities.csv"), index=False)
-    
-    # 儲存每週結算表
-    summary_df = pd.DataFrame({'True Return (%)': weekly_perf_series * 100, 'Weekly Profit (NT$)': pd.Series(weekly_profit)}).round(2)
-    summary_df.to_csv(os.path.join(out_dir, "weekly_summary.csv"))
-    print(f"\n📅 每週結算表:")
-    print(summary_df)
+    if avg_weekly_ret > 0:
+        model_manager.save_model(ai_model, optimizer, {"avg_weekly_ret": avg_weekly_ret}, {"leverage": LEVERAGE})
 
-    # 繪製並儲存資金曲線圖
     plt.figure(figsize=(12, 6))
-    plt.plot(capital_curve, color='#2c3e50', linewidth=2)
-    plt.title(f'Options Intraday Equity Curve (Initial: ${initial_capital:,})', fontsize=14, fontweight='bold')
-    plt.xlabel('Ticks (5m)', fontsize=12)
-    plt.ylabel('Capital (NT$)', fontsize=12)
-    plt.grid(True, alpha=0.3)
-    plt.fill_between(range(len(capital_curve)), capital_curve, initial_capital, where=(np.array(capital_curve) > initial_capital), color='#27ae60', alpha=0.3)
-    plt.fill_between(range(len(capital_curve)), capital_curve, initial_capital, where=(np.array(capital_curve) < initial_capital), color='#c0392b', alpha=0.3)
-    plt.axhline(initial_capital, color='red', linestyle='--')
-    plt.tight_layout()
-    plt.savefig(os.path.join(out_dir, "equity_curve.png"), dpi=300)
-    print(f"\n✅ 數據與波段圖表已匯出至 `{out_dir}` 資料夾中。")
+    plt.plot(capital_curve)
+    plt.savefig(os.path.join(os.path.dirname(__file__), "data_learn", "equity_curve.png"))
 
 if __name__ == "__main__":
-    # 預設以 10 萬台幣本金進行期權回測
-    run_advanced_simulator(initial_capital=100000, days=60)
+    run_advanced_simulator(initial_capital=50000, days=60)

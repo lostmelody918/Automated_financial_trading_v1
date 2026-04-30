@@ -1,0 +1,15 @@
+{
+    "experiment_info": {
+        "version": "v28",
+        "date": "2026-04-30 00:48:50",
+        "model_class": "CompositeDayTradingAI"
+    },
+    "hyperparameters": {
+        "window_size": 40,
+        "input_dim": 31,
+        "epochs": 100
+    },
+    "performance": {
+        "loss": 0.004409245085739291
+    }
+}
