@@ -1,0 +1,13 @@
+{
+    "experiment_info": {
+        "version": "v39",
+        "date": "2026-04-30 12:49:56",
+        "model_class": "CompositeDayTradingAI"
+    },
+    "hyperparameters": {
+        "leverage": 150
+    },
+    "performance": {
+        "avg_weekly_ret": 0.04084750234730113
+    }
+}

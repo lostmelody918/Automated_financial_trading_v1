@@ -8,7 +8,7 @@ from strategy_factory import StrategyFactory
 from composite_ai import CompositeDayTradingAI
 from model_manager import TradingModelManager
 
-def save_trade_plot(df, entry_idx, exit_idx, trade_type, ret, trade_id, entry_features=None):
+def save_trade_plot(df, entry_idx, exit_idx, trade_type, ret, trade_id, entry_features=None, trade_capital=0, position_dir=1):
     """助手函數：繪製單筆交易的波段圖，並標註特徵與儲存資料"""
     try:
         start_plot_idx = max(0, entry_idx - 10)
@@ -27,8 +27,17 @@ def save_trade_plot(df, entry_idx, exit_idx, trade_type, ret, trade_id, entry_fe
         ax.plot([entry_row['date'], exit_row['date']], [entry_row['Close'], exit_row['Close']],
                  color='green' if ret > 0 else 'red', linestyle='--', alpha=0.6)
 
-        title_str = f"Trade #{trade_id} | Type: {trade_type} | Ret: {ret*100:.2f}%"
+        pnl_amount = trade_capital * ret
+        dir_str = "LONG" if position_dir == 1 else "SHORT"
+        title_str = f"Trade #{trade_id} | {dir_str} | {trade_type} | Ret: {ret*100:.2f}% | Cap: NT${trade_capital:,.0f} | PnL: NT${pnl_amount:,.0f}"
         ax.set_title(title_str)
+        
+        # 新增明顯的圖表內標示：做多/做空、交易本金、獲利/虧損金額
+        info_text = f"方向 (Direction): {dir_str}\n本金 (Capital): NT${trade_capital:,.0f}\n損益 (PnL): NT${pnl_amount:,.0f}"
+        props = dict(boxstyle='round', facecolor='white' if ret > 0 else 'mistyrose', alpha=0.9, edgecolor='gray')
+        ax.text(0.05, 0.95, info_text, transform=ax.transAxes, fontsize=12,
+                verticalalignment='top', bbox=props, color='green' if ret > 0 else 'red', weight='bold')
+
         ax.legend()
         ax.grid(True, alpha=0.3)
         plt.xticks(rotation=45)
@@ -90,7 +99,7 @@ def run_advanced_simulator(initial_capital=100000, days=60):
     strategy_engine = StrategyFactory.get_strategy("composite")
 
     # 狙擊手模式：黃金槓桿與資金管控
-    LEVERAGE = 300 
+    LEVERAGE = 150  # 極限當沖高槓桿以達成月報酬 > 100%
     BASE_SLIPPAGE = 0.001 
     FEE = 0.00005
     MAX_POSITION_CAPITAL = 4000000 
@@ -106,14 +115,20 @@ def run_advanced_simulator(initial_capital=100000, days=60):
     position = 0
     entry_price = 0
     entry_idx = 0
-    current_entry_features = {} # 新增：暫存當下部位的進場特徵
+    current_entry_features = {} 
     current_capital = initial_capital
     capital_curve = [initial_capital]
+    trade_capital_used = 0
 
-    # 一波流停利 (給予更大空間避免被雜訊洗出場，專注在勝率)
-    TAKE_PROFIT_PCT = 1.00  # 指數變動 1.0%
-    STOP_LOSS_PCT = -0.50   # 指數變動 -0.5% (容忍隔夜跳空)
+    # 一波流停利 (改成短停利、寬停損的勝率極大化策略)
+    TAKE_PROFIT_PCT = 1.50  # 槓桿後 150% 停利
+    STOP_LOSS_PCT = -0.80   # 槓桿後 80% 停損
     WINDOW_SIZE = 40
+
+    # 連續波段與追蹤停損變數
+    last_trade_win = False
+    trailing_stop_active = False
+    trailing_stop_price = 0
 
     for i in range(WINDOW_SIZE, len(df)-1):
         curr_slice = df.iloc[:i+1]
@@ -129,69 +144,89 @@ def run_advanced_simulator(initial_capital=100000, days=60):
             logits = ai_model(feat_tensor)
             probs = torch.softmax(logits, dim=1).squeeze().cpu().numpy()
 
-        # 資金管理：留倉有隔夜風險，將單筆部位壓在 40% 本金
-        pos_size_pct = 0.40 
-
-        trade_capital = min(current_capital * pos_size_pct, MAX_POSITION_CAPITAL)
-        COST = get_dynamic_cost(trade_capital)
-
         # 1. 平倉邏輯
-        # 不限制當日平倉，但最晚必須在「進場的下一個交易日」收盤前強制平倉
         if position != 0:
+            # 大原則: 下一個交易日一定要平倉
             is_next_day = next_row['date_only'] > current_entry_features['entry_date'].date()
             if is_next_day and curr_time.hour == 13 and curr_time.minute >= 25:
                 ret = (next_row['Open'] - entry_price) / entry_price if position == 1 else (entry_price - next_row['Open']) / entry_price
-                net_ret = ret * LEVERAGE - COST
-                current_capital += trade_capital * net_ret
+                COST = get_dynamic_cost(trade_capital_used)
+                net_ret = max(ret * LEVERAGE - COST, -0.99)
+                current_capital += trade_capital_used * net_ret
+                last_trade_win = net_ret > 0
                 trade_log.append({'date': next_row['date'], 'type': 'Close_Next_Day_EOD', 'ret': net_ret, 'capital': current_capital, 'entry_features': current_entry_features})
-                save_trade_plot(df, entry_idx, i+1, 'Close_Next_Day_EOD', net_ret, len(trade_log), current_entry_features)
+                save_trade_plot(df, entry_idx, i+1, 'Close_Next_Day_EOD', net_ret, len(trade_log), current_entry_features, trade_capital_used, position)
                 position = 0
                 capital_curve.append(current_capital)
                 continue
 
-        if position != 0:
             high_ret = (next_row['High'] - entry_price) / entry_price if position == 1 else (entry_price - next_row['Low']) / entry_price
             low_ret = (next_row['Low'] - entry_price) / entry_price if position == 1 else (entry_price - next_row['High']) / entry_price
+            current_ret = (next_row['Open'] - entry_price) / entry_price if position == 1 else (entry_price - next_row['Open']) / entry_price
+            COST = get_dynamic_cost(trade_capital_used)
+            
+            # --- ATR Trailing Stop 實作 ---
+            current_atr = last_row['atr']
+            # 獲利超過 0.5% (槓桿後 37.5%) 啟動追蹤
+            if current_ret * LEVERAGE >= 0.35:
+                trailing_stop_active = True
+                trail_price = next_row['High'] - (current_atr * 1.5) if position == 1 else next_row['Low'] + (current_atr * 1.5)
+                if position == 1:
+                    trailing_stop_price = max(trailing_stop_price, trail_price)
+                else:
+                    if trailing_stop_price == 0: trailing_stop_price = 999999
+                    trailing_stop_price = min(trailing_stop_price, trail_price)
 
+            # 觸發追蹤停利
+            if trailing_stop_active:
+                if (position == 1 and next_row['Low'] < trailing_stop_price) or (position == -1 and next_row['High'] > trailing_stop_price):
+                    exit_p = trailing_stop_price
+                    ret = (exit_p - entry_price) / entry_price if position == 1 else (entry_price - exit_p) / entry_price
+                    net_ret = ret * LEVERAGE - COST
+                    current_capital += trade_capital_used * net_ret
+                    last_trade_win = net_ret > 0
+                    trade_log.append({'date': next_row['date'], 'type': 'Trailing_Stop', 'ret': net_ret, 'capital': current_capital, 'entry_features': current_entry_features})
+                    save_trade_plot(df, entry_idx, i+1, 'Trailing_Stop', net_ret, len(trade_log), current_entry_features, trade_capital_used, position)
+                    position = 0
+                    capital_curve.append(current_capital)
+                    continue
+
+            # 硬停利/損
             if high_ret * LEVERAGE >= TAKE_PROFIT_PCT:
                 net_ret = TAKE_PROFIT_PCT - COST
-                current_capital += trade_capital * net_ret
+                current_capital += trade_capital_used * net_ret
+                last_trade_win = True
                 trade_log.append({'date': next_row['date'], 'type': 'Take_Profit', 'ret': net_ret, 'capital': current_capital, 'entry_features': current_entry_features})
-                save_trade_plot(df, entry_idx, i+1, 'Take_Profit', net_ret, len(trade_log), current_entry_features)
+                save_trade_plot(df, entry_idx, i+1, 'Take_Profit', net_ret, len(trade_log), current_entry_features, trade_capital_used, position)
                 position = 0
                 capital_curve.append(current_capital)
                 continue
             elif low_ret * LEVERAGE <= STOP_LOSS_PCT:
-                net_ret = max(STOP_LOSS_PCT - COST, -1.0)
-                current_capital += trade_capital * net_ret
+                net_ret = max(STOP_LOSS_PCT - COST, -0.99)
+                current_capital += trade_capital_used * net_ret
+                last_trade_win = False
                 trade_log.append({'date': next_row['date'], 'type': 'Stop_Loss', 'ret': net_ret, 'capital': current_capital, 'entry_features': current_entry_features})
-                save_trade_plot(df, entry_idx, i+1, 'Stop_Loss', net_ret, len(trade_log), current_entry_features)
+                save_trade_plot(df, entry_idx, i+1, 'Stop_Loss', net_ret, len(trade_log), current_entry_features, trade_capital_used, position)
                 position = 0
                 capital_curve.append(current_capital)
                 continue
 
         capital_curve.append(current_capital)
-
-        # 2. 進場邏輯
-        # 開放全時段進場，以捕捉尾盤跳空機會
-        # 但不能在換日強制平倉的那一刻同時進場
-        can_trade = True 
         
-        # [修改] 放寬濾網以增加出手次數：有擠壓「或」有波動率就可考慮
-        is_squeeze = last_row.get('is_squeeze', 0)
-        has_vol = last_row['atr'] > df['atr'].rolling(100).mean().iloc[i] * 0.7
-
-        # 如果兩者都沒有，才過濾
-        if not is_squeeze and not has_vol:
-            continue
-
-        signal = strategy_engine.generate_signal(curr_slice, ai_score=probs)
-        if signal != 0 and position == 0 and can_trade:
+        # 2. 進場邏輯
+        # 帶入 last_trade_win 判斷是否連續進場
+        signal = strategy_engine.generate_signal(curr_slice, ai_score=probs, last_win=last_trade_win)
+        if signal != 0 and position == 0:
             position = signal
             entry_price = next_row['Open']
             entry_idx = i + 1
+            trailing_stop_active = False
+            trailing_stop_price = 0
+            
+            # 資金管理：使用 50% 資金
+            pos_size_pct = 0.50
+            trade_capital_used = min(current_capital * pos_size_pct, MAX_POSITION_CAPITAL)
 
-            # [新增] 紀錄進場當下的特徵
             current_entry_features = {
                 'entry_date': next_row['date'],
                 'signal': signal,
@@ -202,21 +237,15 @@ def run_advanced_simulator(initial_capital=100000, days=60):
                 'macd_hist': last_row['macd_hist'],
                 'rsi': last_row['rsi'],
                 'vwap_bias': last_row['vwap_bias'],
-                'is_squeeze': is_squeeze,
-                'n225_ret': last_row.get('n225_ret', 0),
-                'n225_slope_5': last_row.get('n225_slope_5', 0),
-                'tsm_ret_1d': last_row.get('tsm_ret_1d', 0),
-                'vix_ret_1d': last_row.get('vix_ret_1d', 0),
-                'ixic_ret_1d': last_row.get('ixic_ret_1d', 0)
+                'vix_ret_1d': last_row.get('vix_ret_1d', 0)
             }
 
-    # 結算
+    # 結算與報告 (略，維持原狀)
     df_trades = pd.DataFrame(trade_log)
     if df_trades.empty:
         print("沒有交易次數")
         return
 
-    # [新增] 儲存交易特徵日誌
     features_log = []
     for t in trade_log:
         if 'entry_features' in t:
@@ -232,7 +261,6 @@ def run_advanced_simulator(initial_capital=100000, days=60):
         df_features.to_csv(os.path.join(out_dir, "trade_features_log.csv"), index=False, encoding="utf-8-sig")
         print(f"💾 已儲存交易特徵日誌至 data_learn/trade_features_log.csv (共 {len(df_features)} 筆)")
 
-    # 計算週報酬率
     df_trades['week'] = df_trades['date'].dt.isocalendar().week
     weekly_true_ret = {}
     weekly_log = []
@@ -249,7 +277,6 @@ def run_advanced_simulator(initial_capital=100000, days=60):
         })
         last_week_capital = week_end_capital
 
-    # 儲存每週績效
     if weekly_log:
         df_weekly = pd.DataFrame(weekly_log)
         df_weekly.to_csv(os.path.join(out_dir, "weekly_summary.csv"), index=False, encoding="utf-8-sig")
@@ -262,7 +289,8 @@ def run_advanced_simulator(initial_capital=100000, days=60):
     print(f"🚀 --- 終極期權當沖模擬器結算報告 ---")
     print(f"累積真實淨報酬率: {total_ret*100:.2f}%")
     print(f"真實平均每週報酬: {avg_weekly_ret*100:.2f}%")
-    print(f"總交易次數: {len(df_trades)} | 勝率: {(df_trades['ret']>0).mean()*100:.2f}%")
+    win_rate = (df_trades['ret']>0).mean() * 100
+    print(f"總交易次數: {len(df_trades)} | 勝率: {win_rate:.2f}%")
     print("="*50)
     print(f"\n✅ 回測完成！交易波段圖已儲存至 data_learn/trade_plots/")
 

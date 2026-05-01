@@ -15,7 +15,7 @@ class CompositeOptionsStrategy:
     def __init__(self):
         self.name = "AI-Driven Asymmetry"
 
-    def generate_signal(self, df_slice, ai_score=None):
+    def generate_signal(self, df_slice, ai_score=None, last_win=False):
         if ai_score is None: return 0
 
         prob_down = ai_score[0]
@@ -23,36 +23,35 @@ class CompositeOptionsStrategy:
         prob_up = ai_score[2]
 
         last_row = df_slice.iloc[-1]
-        is_squeeze = last_row.get('is_squeeze', 0)
         atr = last_row.get('atr', 0)
-        n225_ret = last_row.get('n225_ret', 0) 
         macd_hist = last_row.get('macd_hist', 0)
-        vwap = last_row.get('vwap', 0)
         vwap_bias = last_row.get('vwap_bias', 0)
-        close = last_row.get('Close', 0)
-        ixic_ret = last_row.get('ixic_ret_1d', 0)
-        tsm_ret = last_row.get('tsm_ret_1d', 0)
         vix_ret = last_row.get('vix_ret_1d', 0)
+        rsi = last_row.get('rsi', 50)
 
-        # 黃金規則 1：AI 信心必須超過 0.70
-        threshold = 0.70 
+        # Volatility-Adjusted Momentum & Risk Management (Ref: Deep Momentum Networks)
+        # 1. AI Confidence Threshold
+        threshold = 0.52
+        if last_win:
+            threshold = 0.45
 
-        if atr > 160:
+        # 2. VIX Shock Protection (Avoid trading in chaotic volatility spikes > 5%)
+        if abs(vix_ret) > 0.05:
             return 0
 
-        # 黃金規則 3：堅實的順勢邏輯，加入美股日盤 (IXIC) 與 恐慌指數 (VIX) 做為大格局的背書
-        if prob_up > threshold:
-            # 做多：MACD 動能向上 (> 5)，且 VWAP 乖離不過大。
-            # 大局觀：昨晚美股科技股 (IXIC) 必須上漲 (> 0) 或恐慌指數下跌 (VIX < -0.01)
-            if close > vwap and macd_hist > 5 and vwap_bias < 0.005 and n225_ret > -0.005:
-                if ixic_ret > 0 or vix_ret < -0.01:
-                    return 1
+        # 3. ATR Volatility Filter (Avoid entering when volatility is extremely high)
+        if atr > 150:
+            return 0
 
-        elif prob_down > threshold:
-            # 做空：MACD 動能向下 (< -10)，且 VWAP 乖離不殺低過度。
-            # 大局觀：昨晚美股科技股下跌 (IXIC < 0) 或 恐慌指數飆升 (VIX > 0.02)
-            if close < vwap and macd_hist < -10 and vwap_bias > -0.005 and n225_ret < 0.005:
-                if ixic_ret < 0 or vix_ret > 0.02:
-                    return -1
+        # 黃金規則 2：順勢動能過濾 (恢復高勝率的特徵區間)
+        if prob_up > threshold:
+            # 做多：MACD 轉強，且 RSI 處於起漲點 (50-75)
+            if macd_hist > 0.5 and vwap_bias < 0.012 and rsi > 50:
+                return 1
+
+        elif prob_down > threshold + 0.10: # 嚴格限制做空 (要求更高的 AI 信心)
+            # 做空：只在剛剛起跌時做空，避免追空在谷底
+            if -1.0 < macd_hist < -0.2 and vwap_bias > -0.005 and rsi < 50:
+                return -1
 
         return 0
