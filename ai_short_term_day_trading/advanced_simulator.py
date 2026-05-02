@@ -265,22 +265,64 @@ def run_advanced_simulator(initial_capital=100000, days=60):
     weekly_true_ret = {}
     weekly_log = []
     last_week_capital = initial_capital
-    for week, group in df_trades.groupby('week'):
-        week_end_capital = group['capital'].iloc[-1]
-        ret = (week_end_capital - last_week_capital) / last_week_capital
-        weekly_true_ret[week] = ret
-        weekly_log.append({
-            'Week': week,
-            'End_Capital': week_end_capital,
-            'Weekly_Return_%': ret * 100,
-            'Weekly_Profit': week_end_capital - last_week_capital
-        })
-        last_week_capital = week_end_capital
+    
+    # 獲取所有測試天數內的週次 (確保即便沒交易的週也會顯示)
+    all_weeks = sorted(df['date'].dt.isocalendar().week.unique())
+    
+    for week in all_weeks:
+        group = df_trades[df_trades['week'] == week]
+        
+        if not group.empty:
+            week_end_capital = group['capital'].iloc[-1]
+            ret = (week_end_capital - last_week_capital) / last_week_capital
+            
+            # 每週最佳與最差出手
+            best_trade = group.loc[group['ret'].idxmax()]
+            worst_trade = group.loc[group['ret'].idxmin()]
+            
+            best_feat = best_trade['entry_features']
+            worst_feat = worst_trade['entry_features']
+            
+            weekly_log.append({
+                'Week': week,
+                'Week_End_Total_Capital': week_end_capital,
+                'Weekly_Net_Return_%': ret * 100,
+                'Weekly_Profit': week_end_capital - last_week_capital,
+                'Trade_Count': len(group),
+                'Best_Trade_Ret_%': best_trade['ret'] * 100,
+                'Best_Trade_Time': best_feat['entry_date'],
+                'Best_Trade_Type': best_trade['type'],
+                'Best_Trade_Signal': "LONG" if best_feat['signal'] == 1 else "SHORT",
+                'Worst_Trade_Ret_%': worst_trade['ret'] * 100,
+                'Worst_Trade_Time': worst_feat['entry_date'],
+                'Worst_Trade_Type': worst_trade['type'],
+                'Worst_Trade_Signal': "LONG" if worst_feat['signal'] == 1 else "SHORT"
+            })
+            weekly_true_ret[week] = ret
+            last_week_capital = week_end_capital
+        else:
+            # 沒交易的週
+            weekly_log.append({
+                'Week': week,
+                'Week_End_Total_Capital': last_week_capital,
+                'Weekly_Net_Return_%': 0.0,
+                'Weekly_Profit': 0.0,
+                'Trade_Count': 0,
+                'Best_Trade_Ret_%': 0.0,
+                'Best_Trade_Time': "N/A",
+                'Best_Trade_Type': "N/A",
+                'Best_Trade_Signal': "N/A",
+                'Worst_Trade_Ret_%': 0.0,
+                'Worst_Trade_Time': "N/A",
+                'Worst_Trade_Type': "N/A",
+                'Worst_Trade_Signal': "N/A"
+            })
+            weekly_true_ret[week] = 0.0
 
     if weekly_log:
         df_weekly = pd.DataFrame(weekly_log)
         df_weekly.to_csv(os.path.join(out_dir, "weekly_summary.csv"), index=False, encoding="utf-8-sig")
-        print(f"💾 已儲存每週報酬報告至 data_learn/weekly_summary.csv")
+        print(f"💾 已儲存詳細每週報酬報告至 data_learn/weekly_summary.csv (共 {len(df_weekly)} 週)")
 
     avg_weekly_ret = pd.Series(weekly_true_ret).mean()
     total_ret = (current_capital - initial_capital) / initial_capital
