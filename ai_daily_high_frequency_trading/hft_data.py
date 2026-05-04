@@ -33,6 +33,9 @@ def fetch_hft_data(symbol="^TWII", period="2y", interval="1h"):
     df['bb_up'] = df['sma20'] + (df['std20'] * 2.2)
     df['bb_dn'] = df['sma20'] - (df['std20'] * 2.2)
     df['bbw'] = (df['bb_up'] - df['bb_dn']) / (df['sma20'] + 1e-9)
+    df['bbw_mean'] = df['bbw'].rolling(100).mean()
+    df['bbw_std'] = df['bbw'].rolling(100).std()
+    df['bbw_zscore'] = (df['bbw'] - df['bbw_mean']) / (df['bbw_std'] + 1e-9)
     
     df['ema_htf'] = df['Close'].ewm(span=144, adjust=False).mean()
     
@@ -62,10 +65,12 @@ def fetch_hft_data(symbol="^TWII", period="2y", interval="1h"):
     # ATR Change Rate (Simulates Vega expansion/contraction)
     df['atr_roc'] = df['atr'].pct_change(3) # 3-period change rate
     
-    # VWAP (Intraday anchor)
+    # VWAP (Weekly anchor)
     df['typical_price'] = (df['High'] + df['Low'] + df['Close']) / 3
     df['mock_volume'] = df['Volume'].replace(0, 1)
     df['vol_price'] = df['typical_price'] * df['mock_volume']
-    df['vwap'] = df.groupby('date_only')['vol_price'].transform(lambda x: x.cumsum() / df.loc[x.index, 'mock_volume'].cumsum())
+    df['year_week'] = df['date'].dt.isocalendar().year.astype(str) + '-' + df['date'].dt.isocalendar().week.astype(str)
+    df['vwap'] = df.groupby('year_week')['vol_price'].transform(lambda x: x.cumsum() / df.loc[x.index, 'mock_volume'].cumsum())
+    df['vwap'] = df['vwap'].ewm(span=5, adjust=False).mean() # Smoothing to avoid exact match on Monday morning
     
     return df.dropna().reset_index(drop=True)
