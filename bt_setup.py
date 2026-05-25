@@ -57,7 +57,7 @@ class RsiStrategy(bt.Strategy):
 def run_backtest(stock_id: str, strategy=SmaCross, cash: float = 1000000.0, plot: bool = False):
     db = DatabaseManager()
     df = db.load_dataframe(f"stock_{stock_id}_daily")
-    if df.empty: return {"error": f"找不到 {stock_id} 資料。"}
+    if df.empty or len(df) < 50: return {"error": f"找不到 {stock_id} 足夠的歷史資料 (需大於 50 筆)。"}
     
     df['date'] = pd.to_datetime(df['date'])
     df.set_index('date', inplace=True)

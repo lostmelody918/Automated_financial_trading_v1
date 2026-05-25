@@ -22,9 +22,8 @@ class ShortTermWorkflow:
     def prepare_data(self, days=5):
         """模擬獲取短線數據 (1分鐘 K線)"""
         print(f"正在獲取 {self.stock_id} 的短線數據...")
-        # 注意：此處需擴充 data_fetcher 以支援 1min 數據
-        # 暫時使用日線數據作為結構展示，實戰中應替換為 fetch_intraday
-        df = self.fetcher.fetch_stock_daily(self.stock_id, "2024-01-01") 
+        # 使用 fetch_stock_intraday 獲取 1min 數據
+        df = self.fetcher.fetch_stock_intraday(self.stock_id, "2024-01-01") 
         
         if df.empty: return None
         

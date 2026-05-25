@@ -41,12 +41,21 @@ class AdvancedSentimentAnalyzer:
             else:
                 items = []
 
+            if not items:
+                print(f"No news items found for {stock_id}")
+                return pd.DataFrame()
+
             raw_data = []
             now = datetime.now()
             for item in items:
                 title = item.get('title', '')
                 summary = re.sub(r'<[^>]+>', '', item.get('summary', ''))
-                pub_date = pd.to_datetime(item.get('publishAt'), unit='s')
+                
+                # 處理發布時間，若缺失則跳過
+                pub_ts = item.get('publishAt')
+                if not pub_ts:
+                    continue
+                pub_date = pd.to_datetime(pub_ts, unit='s')
 
                 # 計算分數與時間權重
                 score = self.get_basic_score(title + summary)
@@ -61,6 +70,9 @@ class AdvancedSentimentAnalyzer:
                     "加權分數": round(score * weight, 3),
                     "情緒評價": "利多" if score > 0 else ("利空" if score < 0 else "中性")
                 })
+
+            if not raw_data:
+                return pd.DataFrame()
 
             df = pd.DataFrame(raw_data).sort_values('date_obj')
             # 計算情緒不連續性

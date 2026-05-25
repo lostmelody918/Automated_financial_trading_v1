@@ -10,8 +10,8 @@ from model_manager import TradingModelManager
 
 def train_trading_model():
     # 1. 獲取數據
-    engine = DayTradingDataEngine("^TWII")
-    df = engine.fetch_intraday_data(days=60) # 修正：yfinance 5m 數據僅支援 60 天內
+    engine = DayTradingDataEngine()
+    df, _ = engine.fetch_active_option_intraday_data(days=15) # 使用選項權資料訓練，解決 Domain Mismatch
     
     if df.empty:
         print("無法獲取數據")
@@ -38,8 +38,8 @@ def train_trading_model():
     df.dropna(inplace=True)
     df_normalized = df_normalized.iloc[:len(df)]
 
-    # 標籤定義：波段漲跌幅大於 0.35% (大於交易成本) 視為有價差的波段
-    THRESHOLD = 0.0035
+    # 標籤定義：波段漲跌幅大於 8% 視為有價差的波段，確保扣除成本後有利潤
+    THRESHOLD = 0.08
     def classify_trend(row):
         if row['max_up_ret'] > THRESHOLD and row['max_up_ret'] > row['max_down_ret']: return 2 # 大漲波段
         if row['max_down_ret'] > THRESHOLD and row['max_down_ret'] > row['max_up_ret']: return 0 # 大跌波段

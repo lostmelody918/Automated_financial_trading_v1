@@ -1,94 +1,111 @@
-import yfinance as yf
+import os
 import pandas as pd
 import numpy as np
+import shioaji as sj
+from datetime import datetime, timedelta
 
 class DayTradingDataEngine:
-    def __init__(self, symbol="^TWII"):
+    def __init__(self, symbol="2330"):
         self.symbol = symbol
+        self.api = sj.Shioaji()
+        api_key = os.environ.get('SHIOAJI_API_KEY', '')
+        secret_key = os.environ.get('SHIOAJI_SECRET_KEY', '')
+        if api_key and secret_key:
+            self.api.login(api_key, secret_key, contracts_timeout=10000)
+        else:
+            print("Warning: Shioaji API keys missing.")
 
     def fetch_intraday_data(self, days=60):
-        """獲取近 60 天 5 分鐘 K 線，加入台股與美指期(NQ=F)特徵"""
-        print(f"📥 下載 {self.symbol} 與 NQ=F (那斯達克期貨) 近 {days} 天 5 分鐘 K 線數據...")
+        """獲取近 60 天 K 線，使用 Shioaji 進行抓取"""
+        print(f"📥 下載 {self.symbol} 近 {days} 天 K 線數據...")
         
-        # 抓取台股大盤
-        ticker = yf.Ticker(self.symbol)
-        df = ticker.history(period=f"{days}d", interval="5m")
+        try:
+            contract = self.api.Contracts.Stocks[self.symbol]
+        except KeyError:
+            print(f"Contract {self.symbol} not found.")
+            return pd.DataFrame()
+            
+        start_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+        end_date = datetime.now().strftime("%Y-%m-%d")
+        
+        kbars = self.api.kbars(contract, start=start_date, end=end_date)
+        df = pd.DataFrame({**kbars})
+        
         if df.empty:
             return df
             
-        # 抓取日經225 (亞洲盤高度連動)
-        n225_ticker = yf.Ticker("^N225")
-        df_n225 = n225_ticker.history(period=f"{days}d", interval="5m")
-
-        # 抓取台積電 ADR, VIX, 和 那斯達克綜合指數(^IXIC) (日線資料，用於每日開盤情緒)
-        try:
-            tsm_df = yf.Ticker("TSM").history(period=f"{days+10}d", interval="1d")
-            vix_df = yf.Ticker("^VIX").history(period=f"{days+10}d", interval="1d")
-            ixic_df = yf.Ticker("^IXIC").history(period=f"{days+10}d", interval="1d")
-            
-            tsm_df['tsm_ret_1d'] = tsm_df['Close'].pct_change()
-            vix_df['vix_ret_1d'] = vix_df['Close'].pct_change()
-            ixic_df['ixic_ret_1d'] = ixic_df['Close'].pct_change()
-            
-            # 將日線資料的 index 轉為與台灣時間對齊的日期 (美股收盤通常是台灣時間凌晨，所以我們把它對應到當天的台股開盤)
-            tsm_df.index = tsm_df.index.tz_convert('Asia/Taipei').date
-            vix_df.index = vix_df.index.tz_convert('Asia/Taipei').date
-            ixic_df.index = ixic_df.index.tz_convert('Asia/Taipei').date
-        except Exception as e:
-            print(f"⚠️ 無法取得 TSM, VIX, 或 IXIC 數據: {e}")
-            tsm_df = pd.DataFrame()
-            vix_df = pd.DataFrame()
-            ixic_df = pd.DataFrame()
+        df['ts'] = pd.to_datetime(df['ts'])
+        df.rename(columns={'ts': 'date'}, inplace=True)
         
-        df.reset_index(inplace=True)
-        if df['Datetime'].dt.tz is not None:
-            df['Datetime'] = df['Datetime'].dt.tz_convert('Asia/Taipei')
-            
-        # 合併 TSM, VIX, IXIC 特徵
-        df['date_only'] = df['Datetime'].dt.date
-        df['tsm_ret_1d'] = 0.0
-        df['vix_ret_1d'] = 0.0
-        df['ixic_ret_1d'] = 0.0
-        
-        if not tsm_df.empty:
-            # 取得前一個交易日的美股收盤表現 (shift 1 確保沒有未來數據)
-            tsm_dict = tsm_df['tsm_ret_1d'].shift(1).to_dict()
-            df['tsm_ret_1d'] = df['date_only'].map(tsm_dict).fillna(0)
-            
-        if not vix_df.empty:
-            vix_dict = vix_df['vix_ret_1d'].shift(1).to_dict()
-            df['vix_ret_1d'] = df['date_only'].map(vix_dict).fillna(0)
-            
-        if not ixic_df.empty:
-            ixic_dict = ixic_df['ixic_ret_1d'].shift(1).to_dict()
-            df['ixic_ret_1d'] = df['date_only'].map(ixic_dict).fillna(0)
-            
-        if not df_n225.empty:
-            df_n225.reset_index(inplace=True)
-            if df_n225['Datetime'].dt.tz is not None:
-                df_n225['Datetime'] = df_n225['Datetime'].dt.tz_convert('Asia/Taipei')
-            
-            # 計算日經特徵
-            df_n225['n225_ret'] = df_n225['Close'].pct_change()
-            df_n225['n225_slope_5'] = (df_n225['Close'] - df_n225['Close'].shift(5)) / 5.0
-            
-            # 只保留需要的欄位並與台股對齊
-            df_n225_subset = df_n225[['Datetime', 'n225_ret', 'n225_slope_5']]
-            df = pd.merge(df, df_n225_subset, on='Datetime', how='left')
-            
-            # 填補日經沒有交易時段的空值 (向前填補)
-            df['n225_ret'] = df['n225_ret'].fillna(0)
-            df['n225_slope_5'] = df['n225_slope_5'].ffill().fillna(0)
-        else:
-            print("⚠️ 無法取得 ^N225 數據，將使用 0 填補")
-            df['n225_ret'] = 0
-            df['n225_slope_5'] = 0
-        
-        df.rename(columns={'Datetime': 'date'}, inplace=True)
         df['time'] = df['date'].dt.time
         df['date_only'] = df['date'].dt.date
         df['day_of_week'] = df['date'].dt.dayofweek
         df['day'] = df['date'].dt.day
+        
+        # 由於 Shioaji 不易抓取外期指數，這裡暫時將其他特徵填 0 (與舊版相容結構)
+        df['Dividends'] = 0.0
+        df['Stock Splits'] = 0.0
+        df['tsm_ret_1d'] = 0.0
+        df['vix_ret_1d'] = 0.0
+        df['ixic_ret_1d'] = 0.0
+    def fetch_active_option_intraday_data(self, days=1):
+        """獲取目前市場上最活躍的選擇權合約的 K 線資料"""
+        print(f"📥 搜尋市場上最活躍的選擇權合約...")
+        
+        all_contracts = []
+        for cat in ['TXO', 'TX1', 'TX2', 'TX4', 'TX5']:
+            if hasattr(self.api.Contracts.Options, cat):
+                all_contracts.extend([c for c in getattr(self.api.Contracts.Options, cat)])
+                
+        # 由於合約太多，我們只抓最近兩個月份/週別的來比較
+        if not all_contracts:
+            print("找不到任何選擇權合約")
+            return pd.DataFrame(), None
+            
+        delivery_months = sorted(list(set(c.delivery_month for c in all_contracts)))
+        if len(delivery_months) > 2:
+            near_months = delivery_months[:2]
+            all_contracts = [c for c in all_contracts if c.delivery_month in near_months]
+
+        # 批次取得 snapshots
+        try:
+            snapshots = self.api.snapshots(all_contracts)
+        except Exception as e:
+            print(f"取得選擇權 Snapshots 失敗: {e}")
+            return pd.DataFrame(), None
+            
+        volumes = [(all_contracts[i], s.total_volume) for i, s in enumerate(snapshots)]
+        volumes.sort(key=lambda x: x[1], reverse=True)
+        
+        best_contract = volumes[0][0]
+        print(f"⭐ 找到最活躍合約: {best_contract.symbol} (成交量: {volumes[0][1]})")
+        
+        start_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+        end_date = datetime.now().strftime("%Y-%m-%d")
+        
+        kbars = self.api.kbars(best_contract, start=start_date, end=end_date)
+        df = pd.DataFrame({**kbars})
+        
+        if df.empty:
+            print(f"⚠️ {best_contract.symbol} K 線資料為空")
+            return df, best_contract
+            
+        df['ts'] = pd.to_datetime(df['ts'])
+        df.rename(columns={'ts': 'date'}, inplace=True)
+        
+        df['time'] = df['date'].dt.time
+        df['date_only'] = df['date'].dt.date
+        df['day_of_week'] = df['date'].dt.dayofweek
+        df['day'] = df['date'].dt.day
+        
+        # 由於 Shioaji 不易抓取外期指數，這裡暫時將其他特徵填 0 (與舊版相容結構)
+        df['Dividends'] = 0.0
+        df['Stock Splits'] = 0.0
+        df['tsm_ret_1d'] = 0.0
+        df['vix_ret_1d'] = 0.0
+        df['ixic_ret_1d'] = 0.0
+        df['n225_ret'] = 0.0
+        df['n225_slope_5'] = 0.0
         
         # 1. 加入交割日特徵
         df['is_wednesday'] = (df['day_of_week'] == 2).astype(int)
@@ -108,7 +125,6 @@ class DayTradingDataEngine:
         df['slope_5'] = (df['Close'] - df['Close'].shift(5)) / 5.0
         df['slope_10'] = (df['Close'] - df['Close'].shift(10)) / 10.0
         
-        # VWAP (如果 yfinance 回傳的指數成交量為 0，則使用 1 來計算時間加權平均價 TWAP)
         df['typical_price'] = (df['High'] + df['Low'] + df['Close']) / 3
         df['mock_volume'] = df['Volume'].replace(0, 1)
         df['vol_price'] = df['typical_price'] * df['mock_volume']
@@ -145,14 +161,14 @@ class DayTradingDataEngine:
         df['bb_lower'] = df['sma20'] - (df['std20'] * 2)
         df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / df['sma20']
         
-        df['bb_width_ma100'] = df['bb_width'].rolling(100).mean()
-        df['is_squeeze'] = (df['bb_width'] < df['bb_width_ma100']).astype(int)
+        df['bb_width_ma20'] = df['bb_width'].rolling(20).mean()
+        df['is_squeeze'] = (df['bb_width'] < df['bb_width_ma20']).astype(int)
 
         # 成交量變化
         df['v_ma5'] = df['Volume'].rolling(5).mean()
         df['v_rel'] = df['Volume'] / (df['v_ma5'] + 1e-9)
 
         # 清理
-        df.drop(columns=['day', 'is_wednesday', 'typical_price', 'vol_price', 'cum_vol_price', 'cum_vol', 'h_l', 'h_pc', 'l_pc', 'tr', 'sma20', 'std20', 'v_ma5', 'bb_width_ma100'], inplace=True, errors='ignore')
+        df.drop(columns=['day', 'is_wednesday', 'typical_price', 'vol_price', 'cum_vol_price', 'cum_vol', 'h_l', 'h_pc', 'l_pc', 'tr', 'sma20', 'std20', 'v_ma5', 'bb_width_ma20', 'Amount'], inplace=True, errors='ignore')
 
-        return df.dropna()
+        return df.dropna(), best_contract

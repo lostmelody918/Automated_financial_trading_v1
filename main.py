@@ -49,7 +49,7 @@ def main():
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
     # Fetch Command
-    fetch_parser = subparsers.add_parser("fetch", help="Fetch stock data from FinMind")
+    fetch_parser = subparsers.add_parser("fetch", help="Fetch stock data from Shioaji")
     fetch_parser.add_argument("stock_id", type=str, help="Stock ID (e.g., 2330)")
     fetch_parser.add_argument("start_date", type=str, help="Start date (YYYY-MM-DD)")
     fetch_parser.add_argument("--end_date", type=str, default=None, help="End date (YYYY-MM-DD) - Optional")

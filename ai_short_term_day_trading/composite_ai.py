@@ -22,9 +22,9 @@ class CompositeDayTradingAI(nn.Module):
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         
         # 分類頭 (輸出: 3 個類別)
-        self.fc1 = nn.Linear(d_model, 64) # 增加神經元
+        self.fc1 = nn.Linear(d_model, 32)
         self.dropout_fc = nn.Dropout(dropout)
-        self.fc2 = nn.Linear(64, 3) 
+        self.fc2 = nn.Linear(32, 3) 
 
     def forward(self, x):
         # x shape: [batch, seq_len, features]

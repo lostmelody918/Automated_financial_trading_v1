@@ -1,7 +1,7 @@
 import sys
 import traceback
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QLineEdit, QComboBox, QPushButton, QDateEdit,
                              QFormLayout, QGroupBox, QMessageBox, QTextEdit, QCheckBox, QTabWidget)
@@ -57,7 +57,8 @@ class MainWindow(QMainWindow):
         self.market_combo.currentTextChanged.connect(self.on_market_change)
 
         self.api_source_combo = QComboBox()
-        self.api_source_combo.addItems(["預設 (Auto)", "FinMind", "yfinance"])
+        self.api_source_combo.addItems(["預設 (Auto)", "Shioaji", "FinMind", "yfinance"])
+        self.api_source_combo.setCurrentText("Shioaji")
 
         api_form.addRow("選擇市場:", self.market_combo)
         api_form.addRow("API 來源:", self.api_source_combo)
@@ -230,12 +231,12 @@ class MainWindow(QMainWindow):
                 "^GSPC (S&P 500)", "^IXIC (Nasdaq)", "^DJI (Dow Jones)",
                 "AAPL", "MSFT", "GOOGL", "TSLA", "NVDA", "AMD", "META", "AMZN", "NFLX"
             ])
-            self.api_source_combo.setCurrentText("yfinance")
+            self.api_source_combo.setCurrentText("Shioaji")
         else:
             self.industry_combo.setEnabled(True)
             self.update_industry_list()
             self.filter_stocks_by_industry(self.industry_combo.currentText())
-            self.api_source_combo.setCurrentText("FinMind")
+            self.api_source_combo.setCurrentText("Shioaji")
 
     def update_industry_list(self):
         self.industry_combo.clear()
@@ -314,14 +315,22 @@ class MainWindow(QMainWindow):
         selected_sid = self.stock_id_input.currentText().split(" ")[0]
         self.status_lbl.setText(f"狀態: ⏳ 正在計算 {selected_sid} 產業相關性...")
         QApplication.processEvents()
+
+        # 獲取產業代表龍頭股
+        leaders = self.fetcher.get_industry_leaders(industry)
         industry_stocks = self.stock_info_df[self.stock_info_df['industry_category'] == industry]['stock_id'].tolist()
-        # 確保選中的股票在清單中，並取產業前10大 (目前依 ID 排序，若有市值資料可依市值)
+        
+        # 組合比較清單：選中股 + 龍頭股 + 剩餘補位 (上限 10 檔)
         stocks_to_compare = [selected_sid]
-        count = 0
-        for s in industry_stocks:
-            if s != selected_sid and count < 10:
+        for s in leaders:
+            if s != selected_sid and s not in stocks_to_compare:
                 stocks_to_compare.append(s)
-                count += 1
+        
+        for s in industry_stocks:
+            if len(stocks_to_compare) >= 10: break
+            if s != selected_sid and s not in stocks_to_compare:
+                stocks_to_compare.append(s)
+
         start = self.start_date_input.date().toString("yyyy-MM-dd")
         end = self.end_date_input.date().toString("yyyy-MM-dd")
         df_all = self.fetcher.fetch_industry_prices(stocks_to_compare, start, end)
@@ -332,7 +341,7 @@ class MainWindow(QMainWindow):
              self.corr_box.setText(f"警告: 無法獲取選定股票 {selected_sid} 的價格資料，無法進行比較。"); return
 
         corr_matrix = df_all.corr().round(2)
-        self.corr_box.setText(f"【{selected_sid} vs {industry}】產業相關性矩陣\n\n" + corr_matrix.to_string())
+        self.corr_box.setText(f"【{selected_sid} vs {industry} 龍頭】產業相關性矩陣\n\n" + corr_matrix.to_string())
         self.status_lbl.setText("狀態: ✅ 矩陣已生成")
 
     def do_fetch_financials(self):
@@ -366,7 +375,11 @@ class MainWindow(QMainWindow):
                 self.fin_table.setText(f"無法獲取 {sid} 的美股資訊。")
         else:
             # 台股邏輯
-            data = self.fetcher.fetch_stock_financials(sid, start)
+            # 確保抓取足夠近的資料以獲取最新損益表 (預設抓取最近兩年)
+            recent_start = (datetime.now() - timedelta(days=365*2)).strftime("%Y-%m-%d")
+            actual_start = start if start < recent_start else recent_start
+            
+            data = self.fetcher.fetch_stock_financials(sid, actual_start)
             chips = self.fetcher.fetch_stock_chips(sid, start)
             df_rev = self.fetcher.fetch_revenue_breakdown(sid)
 
@@ -377,9 +390,8 @@ class MainWindow(QMainWindow):
                 end = self.end_date_input.date().toString("yyyy-MM-dd")
                 # 強制至少抓取半年 (約 180 天) 前的資料以確保動能指標和均線能正確計算
                 force_start = (datetime.now() - pd.Timedelta(days=180)).strftime("%Y-%m-%d")
-                # 如果使用者設定的開始日期比強制日期還要早，則使用使用者設定的
-                actual_start = start if start < force_start else force_start
-                df_ta = self.fetcher.fetch_stock_daily(sid, actual_start, end)
+                actual_ta_start = start if start < force_start else force_start
+                df_ta = self.fetcher.fetch_stock_daily(sid, actual_ta_start, end)
 
             mom_report = "無資料"
             if not df_ta.empty:
@@ -425,8 +437,11 @@ class MainWindow(QMainWindow):
 
             df_fin = data.get("financials", pd.DataFrame())
             if not df_fin.empty:
-                report += "\n[5. 近期損益摘要]\n"
-                report += df_fin.head(10).to_string()
+                report += "\n[5. 近期損益摘要 (由新到舊)]\n"
+                # 只顯示最近 8 筆
+                report += df_fin.head(15).to_string()
+
+            self.fin_table.setText(report)
 
             self.fin_table.setText(report)
 
@@ -435,9 +450,37 @@ class MainWindow(QMainWindow):
     def load_stock_info(self):
         try:
             df = self.db.load_dataframe("taiwan_stock_info")
-            if df.empty: df = self.fetcher.fetch_stock_info()
+            
+            # 檢查是否需要重新抓取 (如果資料為空，或者產業分類看起來只有數字，或者缺少指數大盤)
+            need_refresh = False
+            if df.empty:
+                need_refresh = True
+            else:
+                # 抽樣檢查產業分類是否包含中文描述
+                sample = df['industry_category'].dropna().unique().tolist()
+                # 如果前 5 個樣本都是純數字或長度 <= 2，則認為需要更新
+                if sample and all(str(s).isdigit() or len(str(s)) <= 2 for s in sample[:5]):
+                    need_refresh = True
+                
+                # 檢查是否包含指數 (00 指數/大盤)
+                if not any("00 指數" in str(s) for s in sample):
+                    need_refresh = True
+            
+            if need_refresh:
+                print("Refreshing stock and index info...")
+                df = self.fetcher.fetch_stock_info()
+            
+            # 確保欄位名稱一致性，避免 KeyError: 'industry_category'
+            if not df.empty:
+                if 'industry' in df.columns and 'industry_category' not in df.columns:
+                    df.rename(columns={'industry': 'industry_category'}, inplace=True)
+                elif 'industry_category' not in df.columns:
+                    # 如果連 industry 都沒有，建立一個空的
+                    df['industry_category'] = '未知'
             return df
-        except: return pd.DataFrame()
+        except Exception as e:
+            print(f"Error loading stock info: {e}")
+            return pd.DataFrame()
 
     def filter_stocks_by_industry(self, industry):
         self.stock_id_input.clear()
@@ -482,7 +525,11 @@ class MainWindow(QMainWindow):
         except Exception as e: QMessageBox.critical(self, "錯誤", str(e))
 
     def do_sentiment_analysis(self):
-        sid = self.stock_id_input.currentText().split(" ")[0]
+        full_text = self.stock_id_input.currentText()
+        sid = full_text.split(" ")[0]
+        # 嘗試取得名稱，以便在 ID 搜不到時備用
+        sname = full_text.split(" ")[1] if " " in full_text else ""
+        
         market = self.market_combo.currentText()
         is_us = "美股" in market
 
@@ -515,15 +562,19 @@ class MainWindow(QMainWindow):
                 # 台股使用整合進來的 AdvancedSentimentAnalyzer
                 analyzer = AdvancedSentimentAnalyzer()
                 df_news = analyzer.fetch_and_analyze(sid)
+                
+                # 如果用代號找不到，試試用名稱
+                if df_news.empty and sname:
+                    df_news = analyzer.fetch_and_analyze(sname)
 
                 if df_news.empty:
-                    self.sentiment_box.setText(f"目前沒有關於 {sid} 的近期新聞資料。")
+                    self.sentiment_box.setText(f"目前沒有關於 {sid} {sname} 的近期新聞資料。\n(建議手動至 Google 搜尋確認)")
                     return
 
                 avg_score = df_news['情緒分數'].mean()
                 weighted_avg = df_news['加權分數'].mean()
 
-                report = f"--- {sid} 深度新聞情緒分析 ({datetime.now().strftime('%Y-%m-%d')}) ---\n\n"
+                report = f"--- {sid} {sname} 深度新聞情緒分析 ({datetime.now().strftime('%Y-%m-%d')}) ---\n\n"
                 report += f"📈 樣本新聞數：{len(df_news)} 則\n"
                 report += f"🌡️ 平均情緒分數：{round(avg_score, 4)}\n"
                 report += f"⏳ 加權情緒分數：{round(weighted_avg, 4)} (已計算時間衰減)\n"

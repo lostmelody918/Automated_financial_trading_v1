@@ -1,27 +1,41 @@
-import yfinance as yf
+import os
 import pandas as pd
 import numpy as np
+import shioaji as sj
+from datetime import datetime, timedelta
 
-def fetch_hft_data(symbol="^TWII", period="2y", interval="1h"):
+def fetch_hft_data(symbol="2330", period="2y", interval="1h"):
     """
-    Fetches historical data for ^TWII. 
-    Note: yfinance limits for intraday:
-    - 1h: 730 days (~2 years)
+    Fetches historical data for symbol using Shioaji.
     """
-    print(f"Fetching {period} of {interval} data for {symbol}...")
-    ticker = yf.Ticker(symbol)
+    print(f"Fetching data for {symbol} using Shioaji...")
     
-    df = ticker.history(period=period, interval=interval)
+    api = sj.Shioaji()
+    api_key = os.environ.get('SHIOAJI_API_KEY', '')
+    secret_key = os.environ.get('SHIOAJI_SECRET_KEY', '')
+    
+    if api_key and secret_key:
+        api.login(api_key, secret_key, contracts_timeout=10000)
+    else:
+        print("Warning: Shioaji API keys missing for HFT data.")
+        return pd.DataFrame()
+        
+    try:
+        contract = api.Contracts.Stocks[symbol]
+    except KeyError:
+        print(f"Contract {symbol} not found.")
+        return pd.DataFrame()
+        
+    start_date = (datetime.now() - timedelta(days=730)).strftime("%Y-%m-%d")
+    end_date = datetime.now().strftime("%Y-%m-%d")
+    
+    kbars = api.kbars(contract, start=start_date, end=end_date)
+    df = pd.DataFrame({**kbars})
+    
     if df.empty: return df
     
-    df.reset_index(inplace=True)
-    if 'Datetime' in df.columns:
-        if df['Datetime'].dt.tz is not None:
-            df['Datetime'] = df['Datetime'].dt.tz_convert('Asia/Taipei')
-        df.rename(columns={'Datetime': 'date'}, inplace=True)
-    elif 'Date' in df.columns:
-        df['date'] = pd.to_datetime(df['Date']).dt.tz_localize('Asia/Taipei')
-    
+    df['ts'] = pd.to_datetime(df['ts'])
+    df.rename(columns={'ts': 'date'}, inplace=True)
     df['date_only'] = df['date'].dt.date
     
     # Technical Indicators (Vectorized)

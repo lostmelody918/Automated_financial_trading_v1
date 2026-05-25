@@ -22,7 +22,7 @@ with open(os.path.join(os.path.dirname(__file__), "data_learn", "loss_analysis_r
     f.write(f"勝率: {len(win_df)/len(df)*100:.2f}%\n\n")
 
     f.write("--- 各時段虧損分佈 (Losses by Hour) ---\n")
-    hourly_loss = loss_df['hour'].value_spacing = loss_df.groupby('hour').size()
+    hourly_loss = loss_df.groupby('hour').size()
     hourly_win = win_df.groupby('hour').size()
     for hour in range(8, 15):
         l_cnt = hourly_loss.get(hour, 0)

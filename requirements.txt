@@ -2,7 +2,6 @@ pandas
 numpy
 pandas-ta
 backtrader
-FinMind
 SQLAlchemy
 scikit-learn
 matplotlib
@@ -11,4 +10,7 @@ mplfinance
 PyQt6
 playwright
 torch
+shioaji
+python-dotenv
+FinMind
 yfinance

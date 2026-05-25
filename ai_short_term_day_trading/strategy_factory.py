@@ -40,18 +40,19 @@ class CompositeOptionsStrategy:
             return 0
 
         # 3. ATR Volatility Filter (Avoid entering when volatility is extremely high)
-        if atr > 150:
+        # 放寬 ATR 的極端值過濾，適應高價位的相對特徵
+        if atr > 500:
             return 0
 
         # 黃金規則 2：順勢動能過濾 (恢復高勝率的特徵區間)
         if prob_up > threshold:
-            # 做多：MACD 轉強，且 RSI 處於起漲點 (50-75)
-            if macd_hist > 0.5 and vwap_bias < 0.012 and rsi > 50:
+            # 做多：MACD 為正向動能，VWAP_bias 相對不偏離太遠 (改用相對的正負號)
+            if macd_hist > 0 and vwap_bias < 0.05 and rsi > 45:
                 return 1
 
         elif prob_down > threshold + 0.10: # 嚴格限制做空 (要求更高的 AI 信心)
-            # 做空：只在剛剛起跌時做空，避免追空在谷底
-            if -1.0 < macd_hist < -0.2 and vwap_bias > -0.005 and rsi < 50:
+            # 做空：MACD 為負向動能
+            if macd_hist < 0 and vwap_bias > -0.05 and rsi < 55:
                 return -1
 
         return 0

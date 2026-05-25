@@ -211,7 +211,7 @@ with tab4:
             with col_f2:
                 st.write("### 營業比重 (真實獲利來源)")
                 if not df_rev.empty:
-                    # 嘗試抓取 FinMind 的營業比重欄位 (通常是 'revenue_name' 與 'revenue_percentage')
+                    # 嘗試抓取 Shioaji 的營業比重欄位 (通常是 'revenue_name' 與 'revenue_percentage')
                     label_col = 'revenue_name' if 'revenue_name' in df_rev.columns else (df_rev.columns[2] if len(df_rev.columns) > 2 else "")
                     val_col = 'revenue_percentage' if 'revenue_percentage' in df_rev.columns else (df_rev.columns[3] if len(df_rev.columns) > 3 else "")
                     
