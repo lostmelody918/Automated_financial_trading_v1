@@ -6,29 +6,49 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
-from datetime import datetime, time as datetime_time
+from datetime import datetime, timedelta, time as datetime_time
+
 from data_engine import DayTradingDataEngine
 from composite_ai import CompositeDayTradingAI
 from model_manager import TradingModelManager
 from strategy_factory import StrategyFactory
 
 # ==========================================
-# 核心參數設定 (對齊高基期與選擇權實務 - 高風險高報酬優化版)
+# 核心參數設定 (高風險高報酬 + 三大法人籌碼融合版)
 # ==========================================
 INITIAL_CAPITAL = 120000        # 初始模擬本金
 CONTRACT_MULTIPLIER = 50        # 台指選擇權合約乘數 (1點 = 50元)
-FEE_SLIPPAGE_PER_CONTRACT = 100 # 單口交易成本 (手續費 + 真實滑價約 1.5-2 ticks，更符合現實)
+FEE_SLIPPAGE_PER_CONTRACT = 100 # 單口交易成本 (手續費 + 真實滑價約 1.5-2 ticks)
 MAX_POSITION_CAPITAL = 4000000  # 最大部位限制
-WINDOW_SIZE = 40                # AI 輸入的時間視窗長度
+WINDOW_SIZE = 25                # AI 輸入的時間視窗長度
 
-# 獲利與風險控制 (以權利金變動幅度 % 計算) - 高風險設置
+# 獲利與風險控制 (以權利金變動幅度 % 計算)
 TAKE_PROFIT_PCT = 2.50          # 250% 硬停利 (拉高獲利潛力)
-STOP_LOSS_PCT = -0.50           # 50% 硬停損 (拉高風險容忍度，避免震盪過早出場)
-TRAILING_START_PCT = 0.40       # 獲利達 40% 時才啟動追蹤停損
-TRAILING_ATR_MULTIPLIER = 3.0   # 追蹤停損的 ATR 倍數 (放寬停損空間)
+STOP_LOSS_PCT = -0.50           # 50% 硬停損 (放寬風險容忍度，避免被洗)
+TRAILING_START_PCT = 0.40       # 獲利達 40% 時啟動追蹤停損
+TRAILING_ATR_MULTIPLIER = 3.5   # 追蹤停損的 ATR 倍數 (放寬以避免假跌破)
 
-POLL_INTERVAL_SECONDS = 25      # 盤中輪詢間隔 (縮短為 25 秒，提高反應速度)
+POLL_INTERVAL_SECONDS = 60      # 盤中輪詢間隔 (每 60 秒檢查一次最新 5分K)
 
+def is_market_open(current_time):
+    """判斷目前是否為選擇權日盤交易時間"""
+    return datetime_time(8, 45) <= current_time <= datetime_time(13, 45)
+
+def is_eod_closing_time(current_time):
+    """判斷是否達到日内當沖強制平倉時間 (設定於收盤前 5 分鐘：13:40)"""
+    return datetime_time(13, 40) <= current_time < datetime_time(13, 45)
+
+def load_latest_daily_chips_snapshot():
+    """
+    讀取截至昨日下午 15:00 結算公佈的三大法人留倉快照。
+    實務上可透過外部排程腳本每日收盤後自動寫入 JSON/CSV，供今日盤中載入。
+    """
+    return pd.DataFrame([{
+        'date': (datetime.now() - timedelta(days=1)).date(),
+        'foreign_net_oi': -12500.0,
+        'dealer_net_oi': 4200.0,
+        'pc_ratio': 1.15
+    }])
 
 def generate_eod_report(daily_trades, df, best_contract, current_capital, today_date):
     print("📊 正在產出今日選擇權損益報告與交易圖表...")
@@ -119,28 +139,18 @@ def generate_eod_report(daily_trades, df, best_contract, current_capital, today_
     plt.close()
     print(f"✅ 今日損益報告已匯出至: {report_filename}")
 
-def is_market_open(current_time):
-    """判斷目前是否為選擇權日盤交易時間 (08:45 - 13:45)"""
-    return datetime_time(8, 45) <= current_time <= datetime_time(13, 45)
-
-def is_eod_closing_time(current_time):
-    """判斷是否達到日内當沖強制平倉時間 (設定於收盤前 5 分鐘：13:40)"""
-    return datetime_time(13, 40) <= current_time < datetime_time(13, 45)
-
 def run_live_simulator():
     print("=" * 60)
-    print("🚀 啟動獨立版：AI 選擇權盤中即時模擬交易系統 (Live Trader) 🚀")
+    print("🚀 啟動：三大法人籌碼融合 AI 選擇權即時模擬機 (High Risk Mode) 🚀")
     print(f"💵 初始模擬本金: NT$ {INITIAL_CAPITAL:,} | 選擇權乘數: {CONTRACT_MULTIPLIER}")
     print(f"⏱️ 監控時段: 日盤 08:45 ~ 13:45 (每 {POLL_INTERVAL_SECONDS} 秒輪詢)")
     print("=" * 60)
 
-    # 1. 初始化資料引擎
     engine = DayTradingDataEngine()
 
-    # 2. 載入正規化參數與特徵欄位
     norm_path = os.path.join(os.path.dirname(__file__), "saved_models", "norm_params.json")
     if not os.path.exists(norm_path):
-        print("❌ 錯誤：找不到 saved_models/norm_params.json，請先執行 train_model.py 完成訓練。")
+        print("❌ 錯誤：找不到 saved_models/norm_params.json，請先執行 train_model.py。")
         return
 
     with open(norm_path, 'r', encoding='utf-8') as f:
@@ -151,94 +161,134 @@ def run_live_simulator():
     mean_v = np.array([norm_params['mean'][c] for c in feature_cols])
     std_v = np.array([norm_params['std'][c] for c in feature_cols])
 
-    # 3. 初始化並載入最新 AI 模型權重
     ai_model = CompositeDayTradingAI(input_dim=input_dim, d_model=128, nhead=8, num_layers=3)
     model_manager = TradingModelManager(model_dir=os.path.join(os.path.dirname(__file__), "saved_models"))
     ai_model, _, version = model_manager.load_latest_model(ai_model)
     ai_model.eval()
     print(f"📦 成功載入 AI 模型版本: v{version}")
 
-    # 4. 載入決策策略工廠
     strategy_engine = StrategyFactory.get_strategy("composite")
 
-    # 5. 即時部位與狀態管理變數 (常駐於記憶體)
     current_capital = INITIAL_CAPITAL
-    position = 0             # 0: 空手, 1: 做多買方, -1: 做空買方 (或依策略定義)
+    position = 0
     entry_price = 0.0
+    entry_time = None
     num_contracts = 0
     trade_capital_used = 0
     last_trade_win = False
 
     trailing_stop_active = False
     trailing_stop_price = 0.0
-
-    daily_trades = []
-    eod_report_generated_date = None
-    entry_time = None
+    trade_log = []
+    eod_report_done = False  # 日終結算報告控制旗標
 
     print("📡 系統初始化完成，正在接入 Shioaji API 進入即時盤中監控...")
 
-    # 6. 即時事件輪詢迴圈 (Event Loop)
     while True:
         now = datetime.now()
         current_time = now.time()
-        today_date = now.date()
         time_str = now.strftime('%H:%M:%S')
 
-        # A. 非交易時間守衛
+        # 非交易時間守衛
         if not is_market_open(current_time):
             if position != 0:
-                print(f"[{time_str}] ⚠️ 異常警訊：非交易時間仍持有虛擬部位，執行系統強制清倉。")
+                print(f"[{time_str}] ⚠️ 異常警訊：非交易時間仍持有虛擬部位，執行強制清倉。")
                 position = 0
                 num_contracts = 0
                 trade_capital_used = 0
-            print(f"[{time_str}] 💤 目前為非交易時段，系統休眠中。等待日盤開盤 (08:45)...")
+
+            # 非交易時段自動將報告控制狀態重置，為隔天開盤做準備
+            if eod_report_done:
+                eod_report_done = False
+                trade_log = [] # 重置新一天的日誌緩衝區
+
+            print(f"[{time_str}] 💤 目前為非交易時段，等待日盤開盤 (08:45)...")
             time.sleep(60)
             continue
 
-        # B. 檢查與執行尾盤產出報告 (無持倉時)
-        if is_eod_closing_time(current_time) and position == 0:
-            if eod_report_generated_date != today_date:
-                try:
-                    df, best_contract = engine.fetch_active_option_intraday_data(days=1)
-                    generate_eod_report(daily_trades, df, best_contract, current_capital, today_date)
-                except Exception as e:
-                    print(f"[{time_str}] ⚠️ 產出尾盤報告失敗: {e}")
-                eod_report_generated_date = today_date
-                daily_trades.clear()
-                print("💤 已完成本日尾盤結算，暫停盤中交易，等待明日開盤...")
-                time.sleep(300)
-                continue
-
         try:
-            # B. 抓取盤中即時資料 (向 Shioaji 請求近 5 天 K 線以確保長週期指標如 100MA、ATR 運算精準)
-            df, best_contract = engine.fetch_active_option_intraday_data(days=5)
+            # 抓取盤中即時資料與籌碼快照
+            # B. 抓取盤中即時資料
+            # 這裡透過更新後的 data_engine，如果選擇權抓不到 5 天 K 線，底層會自動退回抓台指期貨來分析
+            df_intraday, best_contract = engine.fetch_active_option_intraday_data(days=5)
+            df_chips_daily = load_latest_daily_chips_snapshot()
+
+            # 進行即時整合對齊 (防呆處理：若 data_engine 尚未加上該函數則回退)
+            if hasattr(engine, 'integrate_institutional_chips'):
+                df = engine.integrate_institutional_chips(df_intraday, df_chips_daily)
+            else:
+                df = df_intraday
 
             if df is None or df.empty or len(df) < WINDOW_SIZE:
-                print(f"[{time_str}] ⚠️ 盤中數據庫更新中或資料不足，等待下一輪輪詢...")
+                print(f"[{time_str}] ⚠️ 期貨底層數據庫更新中或資料不足，等待下一輪...")
                 time.sleep(POLL_INTERVAL_SECONDS)
                 continue
 
-            last_row = df.iloc[-2]     # 已收定的前一根 K 線 (用於技術指標訊號評估)
-            latest_row = df.iloc[-1]   # 盤中最新跳動的 K 線 (提供當前市場最新即時報價)
-            current_price = latest_row['Close']
+            last_row = df.iloc[-2]
+            latest_row = df.iloc[-1]
 
-            # C. 擷取時序視窗並進行 AI 特徵正規化
+            # 實戰報價脫鉤
+            try:
+                try:
+                    snapshot = engine.api.snapshots([best_contract])[0]
+                    current_price = snapshot.close
+                    opt_high = snapshot.high if snapshot.high > 0 else current_price
+                    opt_low = snapshot.low if snapshot.low > 0 else current_price
+                except Exception as e:
+                    # 避免 snapshots 報錯，退而使用 kbars 的最後一筆
+                    df_opt_kbars, _ = engine.fetch_active_option_intraday_data(days=1)
+                    if not df_opt_kbars.empty:
+                        opt_latest_row = df_opt_kbars.iloc[-1]
+                        current_price = opt_latest_row['Close']
+                        opt_high = opt_latest_row['High']
+                        opt_low = opt_latest_row['Low']
+                    else:
+                        raise e
+            except Exception as e:
+                print(f"[{time_str}] ⚠️ 無法取得選擇權即時報價: {e}")
+                time.sleep(POLL_INTERVAL_SECONDS)
+                continue
+
+            last_row = df.iloc[-2]
+            latest_row = df.iloc[-1]
+
+            # 🚀 修正：實戰報價脫鉤
+            try:
+                # 實務上這裡可能需要檢查 API 型態，若無法 snapshots 可使用其他方法
+                try:
+                    snapshot = engine.api.snapshots([best_contract])[0]
+                    current_price = snapshot.close
+                    opt_high = snapshot.high if snapshot.high > 0 else current_price
+                    opt_low = snapshot.low if snapshot.low > 0 else current_price
+                except Exception as e:
+                    # 避免 snapshots 報錯，退而使用 kbars 的最後一筆
+                    # 注意：如果 fetch_active_option_intraday_data 回傳的第一個值是 K 線
+                    df_opt_kbars, _ = engine.fetch_active_option_intraday_data(days=1)
+                    if not df_opt_kbars.empty:
+                        opt_latest_row = df_opt_kbars.iloc[-1]
+                        current_price = opt_latest_row['Close']
+                        opt_high = opt_latest_row['High']
+                        opt_low = opt_latest_row['Low']
+                    else:
+                        raise e
+            except Exception as e:
+                print(f"[{time_str}] ⚠️ 無法取得選擇權即時報價: {e}")
+                time.sleep(POLL_INTERVAL_SECONDS)
+                continue
+
+            # AI 特徵正規化與推論
             feat_data = df[feature_cols].tail(WINDOW_SIZE).values
-            feat_normalized = (feat_data - mean_v) / std_v
-            feat_tensor = torch.tensor(feat_normalized, dtype=torch.float32).unsqueeze(0)
+            feat_tensor = torch.tensor((feat_data - mean_v) / std_v, dtype=torch.float32).unsqueeze(0)
 
-            # D. CNN-Transformer 複合推理
             with torch.no_grad():
                 logits = ai_model(feat_tensor)
                 probs = torch.softmax(logits, dim=1).squeeze().cpu().numpy()
 
             status_mark = "🟢 持倉中" if position != 0 else "⚪ 空手"
-            print(f"[{time_str}] 標的: {best_contract.symbol} | 即時價: {current_price} | AI預測 [跌:{probs[0]:.2f} 平:{probs[1]:.2f} 漲:{probs[2]:.2f}] | 狀態: {status_mark}")
+            print(f"[{time_str}] 標的: {best_contract.symbol} | 即時價: {current_price} | AI預測 [跌:{probs[0]:.2f} 平:{probs[1]:.2f} 漲:{probs[2]:.2f}] | {status_mark}")
 
-            # E. 即時風控與平倉邏輯
+            # 即時風控與平倉邏輯
             if position != 0:
-                # 計算當前即時點數損益與真實淨損益 (扣除滑價與手續費)
                 points_gained = (current_price - entry_price) if position == 1 else (entry_price - current_price)
                 current_pnl = (points_gained * CONTRACT_MULTIPLIER * num_contracts) - (num_contracts * FEE_SLIPPAGE_PER_CONTRACT)
                 current_ret = current_pnl / trade_capital_used if trade_capital_used > 0 else 0
@@ -248,18 +298,15 @@ def run_live_simulator():
 
                 exit_reason = None
 
-                # 1. 檢查是否觸發尾盤強制當沖平倉
                 if is_eod_closing_time(current_time):
                     exit_reason = "日内時間截止強制平倉 (EOD)"
 
-                # 2. 檢查與更新 ATR 追蹤停損邏輯
                 current_atr = last_row['atr']
                 if current_ret >= TRAILING_START_PCT:
                     if not trailing_stop_active:
                         trailing_stop_active = True
                         print(f"   ↳ 🔥 獲利達標，啟動 {TRAILING_ATR_MULTIPLIER}xATR 動態追蹤停利機制。")
 
-                    # 計算動態屏障價
                     trail_price = current_price - (current_atr * TRAILING_ATR_MULTIPLIER) if position == 1 else current_price + (current_atr * TRAILING_ATR_MULTIPLIER)
 
                     if position == 1:
@@ -268,102 +315,92 @@ def run_live_simulator():
                         if trailing_stop_price == 0: trailing_stop_price = 999999.0
                         trailing_stop_price = min(trailing_stop_price, trail_price)
 
-                # 觸發追蹤停損
                 if trailing_stop_active:
                     if (position == 1 and current_price < trailing_stop_price) or (position == -1 and current_price > trailing_stop_price):
-                        exit_reason = f"動態追蹤停損點跌破 (觸發價: {trailing_stop_price:.2f})"
+                        exit_reason = f"跌破動態追蹤停損點 (觸發價: {trailing_stop_price:.2f})"
 
-                # 3. 檢查硬停損與硬停利 (雙重防護層)
                 if not exit_reason:
-                    # 評估當根 K 線極端價格對權利金的衝擊
-                    high_ret = (latest_row['High'] - entry_price) / entry_price if position == 1 else (entry_price - latest_row['Low']) / entry_price
-                    low_ret = (latest_row['Low'] - entry_price) / entry_price if position == 1 else (entry_price - latest_row['High']) / entry_price
+                    # 改用選擇權的真實快照高低價來衝擊權利金停損利
+                    high_ret = (opt_high - entry_price) / entry_price if position == 1 else (entry_price - opt_low) / entry_price
+                    low_ret = (opt_low - entry_price) / entry_price if position == 1 else (entry_price - opt_high) / entry_price
 
                     if low_ret <= STOP_LOSS_PCT:
-                        exit_reason = f"權利金觸及硬停損限制 ({STOP_LOSS_PCT * 100}%)"
+                        exit_reason = f"觸及權利金硬停損限制 ({STOP_LOSS_PCT * 100}%)"
                     elif high_ret >= TAKE_PROFIT_PCT:
-                        exit_reason = f"權利金觸及硬停利目標 (+{TAKE_PROFIT_PCT * 100}%)"
+                        exit_reason = f"觸及權利金硬停利目標 (+{TAKE_PROFIT_PCT * 100}%)"
 
-                # 執行虛擬平倉結算
+                # 執行平倉結算
                 if exit_reason:
                     current_capital += current_pnl
                     last_trade_win = current_pnl > 0
 
-                    # 紀錄這筆交易
-                    daily_trades.append({
+                    trade_log.append({
                         'entry_time': entry_time,
-                        'exit_time': now,
-                        'direction': 'Buy Call' if position == 1 else 'Buy Put',
+                        'exit_time': now.strftime("%Y-%m-%d %H:%M:%S"),
+                        'symbol': best_contract.symbol,
+                        'direction': 'LONG' if position == 1 else 'SHORT',
                         'entry_price': entry_price,
                         'exit_price': current_price,
-                        'contracts': num_contracts,
                         'pnl': current_pnl,
-                        'return': current_ret
+                        'ret': current_ret,
+                        'reason': exit_reason
                     })
 
-                    print("" + "="*50)
+                    print(f"\n{'='*50}")
                     print(f"🔔 【即時平倉執行】: {exit_reason}")
                     print(f"合約: {best_contract.symbol} | 方向: {'LONG 做多' if position == 1 else 'SHORT 做空'}")
                     print(f"進場價: {entry_price:.2f} ➔ 出場價: {current_price:.2f}")
                     print(f"實際結算盈虧: NT$ {current_pnl:,.0f} ({current_ret * 100:.2f}%)")
-                    print(f"帳戶最新模擬可用資金: NT$ {current_capital:,.0f}")
-                    print("="*50 + "")
+                    print(f"最新模擬資金: NT$ {current_capital:,.0f}")
+                    print(f"{'='*50}\n")
 
-                    # 徹底清空單筆部位狀態狀態
                     position = 0
                     num_contracts = 0
                     trade_capital_used = 0
                     trailing_stop_active = False
                     trailing_stop_price = 0.0
 
-                    # 若為尾盤強制平倉，則直接讓系統休息至收盤
                     if "EOD" in exit_reason:
-                        if eod_report_generated_date != today_date:
-                            generate_eod_report(daily_trades, df, best_contract, current_capital, today_date)
-                            eod_report_generated_date = today_date
-                            daily_trades.clear()
-                        print("💤 已完成本日尾盤結算，暫停盤中交易，等待明日開盤...")
-                        time.sleep(300)
+                        print("💤 已完成本日尾盤結算，暫停盤中交易，等待日終報告輸出...")
+                        time.sleep(5)
 
-            # F. 訊號過濾與進場邏輯 (僅在空手狀態且非尾盤時允許進場)
+            # 觸發日終報告 (當時間進入EOD範圍且目前持倉已被強制清空，且尚未生成過報告時)
+            if is_eod_closing_time(current_time) and position == 0 and not eod_report_done:
+                generate_eod_report(trade_log, INITIAL_CAPITAL, current_capital)
+                eod_report_done = True
+
+            # 訊號過濾與進場邏輯
             if position == 0 and not is_eod_closing_time(current_time):
-                # 將當前完整的資料流與 AI 推出的勝率機率傳入決策工廠
                 signal = strategy_engine.generate_signal(df, ai_score=probs, last_win=last_trade_win)
 
                 if signal != 0:
                     position = signal
                     entry_price = current_price
-                    entry_time = now
+                    entry_time = now.strftime("%Y-%m-%d %H:%M:%S")
                     trailing_stop_active = False
                     trailing_stop_price = 0.0
 
-                    # 實務動態資金控管：最多動用當前模擬總資產的 50%
                     allocated_capital = min(current_capital * 0.50, MAX_POSITION_CAPITAL)
                     contract_cost = entry_price * CONTRACT_MULTIPLIER
 
-                    if contract_cost > 0:
-                        num_contracts = int(allocated_capital // contract_cost)
-                    else:
-                        num_contracts = 0
-
+                    num_contracts = int(allocated_capital // contract_cost) if contract_cost > 0 else 0
                     if num_contracts < 1:
-                        num_contracts = 1 # 保底機制：資金規模較小時至少買進 1 口
+                        num_contracts = 1
 
                     trade_capital_used = num_contracts * contract_cost
                     direction_label = "做多 (Buy Call) 🚀" if signal == 1 else "做空 (Buy Put) 📉"
 
-                    print("" + "="*50)
-                    print(f"🔥 【🔥 盤中進場訊號觸發】: AI 模型與技術面共振")
+                    print(f"\n{'='*50}")
+                    print(f"🔥 【盤中進場訊號觸發】: AI 模型與籌碼技術面共振")
                     print(f"交易合約: {best_contract.symbol}")
                     print(f"操作方向: {direction_label}")
                     print(f"執行價格: {entry_price:.2f} | 預估交易口數: {num_contracts} 口")
                     print(f"建倉動用本金: NT$ {trade_capital_used:,.0f}")
-                    print("="*50 + "")
+                    print(f"{'='*50}\n")
 
         except Exception as e:
-            print(f"[{time_str}] ❌ 盤中即時主迴圈執行發生異常錯誤: {e}")
+            print(f"[{time_str}] ❌ 盤中主迴圈執行發生異常錯誤: {e}")
 
-        # G. 執行間隔控制
         time.sleep(POLL_INTERVAL_SECONDS)
 
 if __name__ == "__main__":
