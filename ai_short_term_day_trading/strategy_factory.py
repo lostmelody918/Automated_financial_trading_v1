@@ -1,58 +1,71 @@
 import numpy as np
 
 class StrategyFactory:
-    """模組化策略工廠：可快速新增、抽換金融策略"""
-    
+    """模組化策略工廠：雙軌制動能共振系統"""
     @staticmethod
     def get_strategy(strategy_name="composite"):
         return CompositeOptionsStrategy()
 
 class CompositeOptionsStrategy:
-    """
-    華爾街量化波段當沖：AI-Driven Options Asymmetry
-    在訓練出高準確度的 CNN-Transformer 複合模型後，直接由 AI 接管交易方向，釋放最大獲利潛能。
-    """
     def __init__(self):
-        self.name = "AI-Driven Asymmetry"
+        self.name = "Dual-Track Momentum"
 
     def generate_signal(self, df_slice, ai_score=None, last_win=False):
         if ai_score is None: return 0
 
-        prob_down = ai_score[0]
-        prob_neutral = ai_score[1]
-        prob_up = ai_score[2]
-
+        prob_down, prob_neutral, prob_up = ai_score[0], ai_score[1], ai_score[2]
         last_row = df_slice.iloc[-1]
-        atr = last_row.get('atr', 0)
+
         macd_hist = last_row.get('macd_hist', 0)
-        vwap_bias = last_row.get('vwap_bias', 0)
-        vix_ret = last_row.get('vix_ret_1d', 0)
-        rsi = last_row.get('rsi', 50)
+        slope_vwap = last_row.get('slope_vwap', 0)
+        atr = last_row.get('atr', 0)
+        vol_surge = last_row.get('vol_surge_ratio', 1.0)
+        is_squeeze = last_row.get('is_squeeze', 0)
+        foreign_oi_mom = last_row.get('foreign_net_oi_momentum', 0)
+        pc_ratio = last_row.get('pc_ratio', 1.0)
 
-        # Volatility-Adjusted Momentum & Risk Management (Ref: Deep Momentum Networks)
-        # 1. AI Confidence Threshold
-        threshold = 0.52
-        if last_win:
-            threshold = 0.45
+        # 基礎 AI 門檻
+        base_threshold = 0.50 if last_win else 0.52
+        if is_squeeze == 1: base_threshold -= 0.05
 
-        # 2. VIX Shock Protection (Avoid trading in chaotic volatility spikes > 5%)
-        if abs(vix_ret) > 0.05:
-            return 0
+        if atr > 100: return 0 # 防禦快市
 
-        # 3. ATR Volatility Filter (Avoid entering when volatility is extremely high)
-        # 放寬 ATR 的極端值過濾，適應高價位的相對特徵
-        if atr > 500:
-            return 0
+        # ==========================================
+        # 🚀 軌道一：強勢共振 (大波段，訊號 2 / -2)
+        # 嚴格條件：AI高自信 + 有斜率 + 爆量/擠壓 + 籌碼支持
+        # ==========================================
+        # 放寬 AI 門檻從 0.58 -> 0.55，斜率從 0.3 -> 0.2
+        strong_up = (prob_up > 0.55 and slope_vwap > 0.2 and macd_hist > 0 and
+                     (vol_surge > 1.5 or is_squeeze == 1) and pc_ratio < 1.15)
 
-        # 黃金規則 2：順勢動能過濾 (恢復高勝率的特徵區間)
-        if prob_up > threshold:
-            # 做多：MACD 為正向動能，VWAP_bias 相對不偏離太遠 (改用相對的正負號)
-            if macd_hist > 0 and vwap_bias < 0.05 and rsi > 45:
-                return 1
+        strong_down = (prob_down > 0.55 and slope_vwap < -0.2 and macd_hist < 0 and
+                       (vol_surge > 1.5 or is_squeeze == 1) and foreign_oi_mom < 0)
 
-        elif prob_down > threshold + 0.10: # 嚴格限制做空 (要求更高的 AI 信心)
-            # 做空：MACD 為負向動能
-            if macd_hist < 0 and vwap_bias > -0.05 and rsi < 55:
-                return -1
+        if strong_up: return 3
+        if strong_down: return -3
+
+        # ==========================================
+        # 📈 Level 2：標準波段 (趨勢成型)
+        # ==========================================
+        # 放寬 AI 門檻從 0.51 -> 0.48，斜率從 0.125 -> 0.08
+        l2_up = (prob_up > 0.48 and slope_vwap > 0.08 and macd_hist > 0 and pc_ratio < 1.4)
+        l2_down = (prob_down > 0.48 and slope_vwap < -0.08 and macd_hist < 0)
+
+        if l2_up: return 2
+        if l2_down: return -2
+
+        # ==========================================
+        # ⚡ Level 1：短線打帶跑 (動能初現或布林擠壓)
+        # ==========================================
+        # 極度放寬 AI 門檻從 0.38 -> 0.15 (應使用者要求強制提高交易頻率)
+        base_threshold = 0.12 if last_win else 0.15
+        if is_squeeze == 1: base_threshold -= 0.05
+
+        # 只要有一邊勝率大於另一邊，且突破極低門檻
+        l1_up = (prob_up > base_threshold) and (prob_up > prob_down + 0.02)
+        l1_down = (prob_down > base_threshold) and (prob_down > prob_up + 0.02)
+
+        if l1_up: return 1
+        if l1_down: return -1
 
         return 0

@@ -5,49 +5,80 @@ import pandas as pd
 import numpy as np
 import os
 import json
+import time as time_lib
 from data_engine import DayTradingDataEngine
 from composite_ai import CompositeDayTradingAI
 from model_manager import TradingModelManager
 
 def train_trading_model(df_daily_chips_input=None):
-    """
-    完整訓練流程：包含三大法人籌碼變數與高基期選擇權利金目標優化
-    """
-    engine = DayTradingDataEngine()
-    # 擴大回測/訓練天數，確保能涵蓋長週期籌碼與均線運算
-    df_raw, _ = engine.fetch_active_option_intraday_data(days=60)
+    # 自動偵測 GPU，若失敗則回退 CPU
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"\n🖥️  系統偵測運算設備: {device.type.upper()}")
 
-    if df_raw.empty:
-        print("無法獲取即時/歷史 K 線數據")
+    engine = DayTradingDataEngine()
+    print("📥 下載台指期貨歷史 K 線進行 AI 訓練...")
+    df_raw = engine.fetch_intraday_data(days=60)
+
+    # 必須在這裡先定義 window_size，否則後面的檢查會報錯
+    window_size = 40
+
+    if df_raw is None or df_raw.empty:
+        print("❌ 無法獲取期貨歷史 K 線數據")
         return
 
-    # 1. 融入三大法人籌碼數據
+    # 1. 籌碼數據融合
     if df_daily_chips_input is not None:
-        df = engine.integrate_institutional_chips(df_raw, df_daily_chips_input)
+        if hasattr(engine, 'integrate_institutional_chips'):
+            df = engine.integrate_institutional_chips(df_raw, df_daily_chips_input)
+            if df.isnull().values.any():
+                print(f"⚠️ 警告：資料中尚有 {df.isnull().sum().sum()} 個空值，將自動填補為 0")
+                df.fillna(0, inplace=True)
+
+            print(f"DEBUG: df_raw 形狀 {df_raw.shape}")
+            print(f"DEBUG: df 合併後形狀 {df.shape}")
+            print(f"✅ 準備訓練！資料總列數: {len(df)}")
+        else:
+            df = df_raw
     else:
-        # 若無外部輸入，模擬生成相容結構欄位以維持 pipeline 暢通
         print("⚠️ 未偵測到外部籌碼日誌，啟用基本結構適配中...")
         df = df_raw.copy()
-        df['foreign_net_oi'] = 0.0
-        df['dealer_net_oi'] = 0.0
-        df['foreign_oi_zscore'] = 0.0
-        df['dealer_oi_zscore'] = 0.0
-        df['foreign_oi_momentum'] = 0.0
-        df['dealer_oi_momentum'] = 0.0
+        for col in ['foreign_net_oi', 'dealer_net_oi', 'foreign_oi_zscore', 'dealer_oi_zscore', 'foreign_oi_momentum', 'dealer_oi_momentum']:
+            df[col] = 0.0
         df['pc_ratio'] = 1.0
         df['pc_ratio_momentum'] = 0.0
 
-    # 2. 自動過濾特徵欄位 (排除非結構化時間欄位)
     exclude_cols = ['date', 'time', 'date_only', 'day_of_week', 'label', 'future_max', 'future_min', 'max_up_ret', 'max_down_ret']
     feature_cols = [c for c in df.columns if c not in exclude_cols]
-
-    # 進行特徵空間標準化
     df_feat = df[feature_cols].copy()
-    mean = df_feat.mean()
-    std = df_feat.std() + 1e-9
-    df_normalized = (df_feat - mean) / std
 
-    # 3. 建立 42,442 點高基期專屬標籤：未來 5 根 K 線內漲跌幅必須大於 8%
+    # ==========================================
+    # 🚀 突破口 A：非線性濾波 (Log Transform)
+    # ==========================================
+    log_features = ['mock_volume', 'macd_hist', 'vwap_bias']
+    for col in log_features:
+        if col in df_feat.columns:
+            df_feat[col] = np.sign(df_feat[col]) * np.log1p(np.abs(df_feat[col]))
+
+    # ==========================================
+    # 🚀 突破口 B：穩健標準化 (Robust Scaling) - 完美保留黑天鵝極值
+    # ==========================================
+    # i.確保只對數值欄位操作 (防禦性程式設計)
+    df_numeric = df_feat.select_dtypes(include=[np.number])
+    # ii.計算正規化參數
+    median = df_numeric.median()
+    iqr = df_numeric.quantile(0.75) - df_numeric.quantile(0.25)
+    # iii.防止除以 0 (如果某欄位數值完全沒變，IQR 會是 0)
+    iqr = iqr.replace(0, 1.0)
+    # iv.執行正規化
+    df_normalized = (df_numeric - median) / iqr
+    # v.後續模型輸入需要將非數值欄位補回來 (如果模型需要的話)
+    # 或者直接將 df_normalized 轉為 Tensor 進行訓練
+    df_normalized = df_normalized.fillna(0) # 確保填補掉計算後的 NaN
+
+    input_dim = df_normalized.shape[1]
+    print(f"✅ 正規化完成，最終輸入特徵維度 (input_dim): {input_dim}")
+
+    # 3. 建立標籤
     future_window = 5
     df['future_max'] = df['Close'].shift(-future_window).rolling(window=future_window).max()
     df['future_min'] = df['Close'].shift(-future_window).rolling(window=future_window).min()
@@ -57,17 +88,22 @@ def train_trading_model(df_daily_chips_input=None):
     df.dropna(subset=['future_max', 'future_min'], inplace=True)
     df_normalized = df_normalized.iloc[:len(df)]
 
-    THRESHOLD = 0.08 # 權利金變動幅度門檻
+    THRESHOLD = 0.0015
     def classify_trend(row):
-        if row['max_up_ret'] > THRESHOLD and row['max_up_ret'] > row['max_down_ret']: return 2 # 波段噴發多單
-        if row['max_down_ret'] > THRESHOLD and row['max_down_ret'] > row['max_up_ret']: return 0 # 波段崩跌空單
-        return 1 # 雜訊盤整
+        if row['max_up_ret'] > THRESHOLD and row['max_up_ret'] > row['max_down_ret']: return 2
+        if row['max_down_ret'] > THRESHOLD and row['max_down_ret'] > row['max_up_ret']: return 0
+        return 1
 
     df['label'] = df.apply(classify_trend, axis=1)
 
-    # 4. 時序滑動視窗構建 (Windowing)
+    # 4. 時序滑動視窗構建
+    print(f"📊 檢查樣本數: {len(df_normalized)}")
+    if len(df_normalized) < window_size:
+        print(f"❌ 嚴重錯誤：資料處理後樣本數僅 {len(df_normalized)}，小於 window_size ({window_size})！請檢查資料來源與日期對齊。")
+        return # 提前結束，避免除以零
+
     X, y = [], []
-    window_size = 25
+
     data_values = df_normalized.values
     label_values = df['label'].values
 
@@ -76,51 +112,124 @@ def train_trading_model(df_daily_chips_input=None):
         y.append(label_values[i])
 
     X = torch.tensor(np.array(X), dtype=torch.float32)
+    # X 形狀是 (Batch, Window, Features) = (N, 40, 25)
+    # 不需在這裡轉置，因為 CompositeDayTradingAI 內部會自動處理 transpose
+
     y = torch.tensor(np.array(y), dtype=torch.long)
 
-    # 5. 模型初始化 (網路結構維度隨籌碼特徵自動擴展)
-    input_dim = len(feature_cols)
-    model = CompositeDayTradingAI(input_dim=input_dim, d_model=128, nhead=8, num_layers=3)
-    optimizer = optim.Adam(model.parameters(), lr=0.0002, weight_decay=1e-4)
+    # 驗證形狀是否正確
+    print(f"DEBUG: X shape before model: {X.shape}") # 應該要是 (N, 40, 25)
 
-    # 反比類別權重計算，修正盤整樣本過多的不平衡問題
+    # 5. 模型初始化與訓練
+    input_dim = X.shape[2]  # 特徵維度是在最後一個維度
+    print(f"✅ 模型輸入維度自動對齊: {input_dim}")
+    model = CompositeDayTradingAI(input_dim=input_dim, d_model=256, nhead=16, num_layers=4)
+    model = model.to(device)
+
+    # 優化：維持固定的初始動能，不再一開始就讓它溜滑梯
+    optimizer = optim.Adam(model.parameters(), lr=0.0002, weight_decay=1e-5)
+    epochs = 150
+
+    # 突破 1：高原退火法 (只有當 Loss 連續 5 個 Epoch 降不下來時，才把學習率乘以 0.5)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, min_lr=1e-6)
+
     counts = df['label'].value_counts().sort_index().values
-    weights = 1.0 / (counts + 1e-9)
+    weights = 1.0 / (counts + 1e-8)
+    weights = np.sqrt(weights)
     weights = weights / weights.sum() * 3.0
-    class_weights = torch.tensor(weights, dtype=torch.float32)
+    alpha_weights = torch.tensor(weights, dtype=torch.float32).to(device)
 
-    criterion = nn.CrossEntropyLoss(weight=class_weights)
+    # ==========================================
+    # 🚀 突破 2 & 3：實作 Focal Loss 函數
+    # ==========================================
+    def focal_loss(inputs, targets, alpha, gamma=2.0):
+        ce_loss = nn.CrossEntropyLoss(weight=alpha, reduction='none')(inputs, targets)
+        pt = torch.exp(-ce_loss)
+        f_loss = ((1 - pt) ** gamma) * ce_loss
+        return f_loss.mean()
 
-    print(f"🚀 開始特徵融合分類訓練... 輸入特徵維度: {input_dim}, 總樣本數: {len(X)}")
+    print(f"🚀 開始【Focal Loss 深度特徵版】分類訓練... 輸入維度: {input_dim}, 總樣本數: {len(X)}")
+    
+    # 優化：使用 DataLoader 處理批次，並加入 shuffle 防過擬合
+    from torch.utils.data import TensorDataset, DataLoader
+    dataset = TensorDataset(X, y)
+    batch_size = 128
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, pin_memory=(device.type=='cuda'))
+
+    # 優化：設定 Early Stopping 機制與 AMP 混合精度訓練以加速並防止過擬合
+    best_loss = float('inf')
+    early_stop_patience = 20
+    patience_counter = 0
+    scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
+
     model.train()
-    epochs = 100
-    batch_size = 64
+    start_time = time_lib.time()
 
     for epoch in range(epochs):
         epoch_loss = 0
-        for i in range(0, len(X), batch_size):
-            batch_X = X[i:i+batch_size]
-            batch_y = y[i:i+batch_size]
+        for batch_X, batch_y in dataloader:
+            batch_X = batch_X.to(device, non_blocking=True)
+            batch_y = batch_y.to(device, non_blocking=True)
 
-            optimizer.zero_grad()
-            outputs = model(batch_X)
-            loss = criterion(outputs, batch_y)
-            loss.backward()
-            optimizer.step()
+            optimizer.zero_grad(set_to_none=True) # 優化記憶體
+            
+            # 使用混合精度加速 (若有 GPU)
+            if scaler is not None:
+                with torch.amp.autocast('cuda'):
+                    outputs = model(batch_X)
+                    loss = focal_loss(outputs, batch_y, alpha=alpha_weights)
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                outputs = model(batch_X)
+                loss = focal_loss(outputs, batch_y, alpha=alpha_weights)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                
             epoch_loss += loss.item()
 
+        avg_epoch_loss = epoch_loss / len(dataloader)
+
+        # 讓 scheduler 根據這個 Epoch 的 Loss 來決定要不要降學習率
+        scheduler.step(avg_epoch_loss)
+
+        # Early Stopping 檢查
+        if avg_epoch_loss < best_loss:
+            best_loss = avg_epoch_loss
+            patience_counter = 0
+            # 可以在此暫存最好的 model_state_dict，此處從簡只計算 best_loss
+        else:
+            patience_counter += 1
+
         if (epoch+1) % 10 == 0:
-            print(f"Epoch [{epoch+1}/{epochs}], Loss: {epoch_loss/(len(X)/batch_size):.4f}")
+            elapsed = time_lib.time() - start_time
+            current_lr = optimizer.param_groups[0]['lr']
+            print(f"Epoch [{epoch+1}/{epochs}], Focal Loss: {avg_epoch_loss:.4f} | LR: {current_lr:.6f} | 耗時: {elapsed:.2f} 秒")
+            
+        if patience_counter >= early_stop_patience:
+            print(f"🛑 觸發 Early Stopping，訓練提早結束於 Epoch {epoch+1}，最佳 Loss: {best_loss:.4f}")
+            break
 
-    # 6. 版本化儲存
+    model = model.to('cpu')
+
     manager = TradingModelManager(model_dir=os.path.join(os.path.dirname(__file__), "saved_models"))
-    manager.save_model(model, optimizer, {"loss": epoch_loss/len(X)}, {"window_size": window_size, "epochs": epochs})
+    manager.save_model(model, optimizer, {"loss": avg_epoch_loss}, {"window_size": window_size, "epochs": epochs})
 
-    norm_params = {"mean": mean.to_dict(), "std": std.to_dict(), "feature_cols": feature_cols}
-    with open(os.path.join(os.path.dirname(__file__), "saved_models", "norm_params.json"), "w", encoding='utf-8') as f: json.dump(norm_params, f)
-    print("✅ 籌碼特徵融合模型訓練完畢。")
+    norm_params = {"mean": median.to_dict(), "std": iqr.to_dict(), "feature_cols": feature_cols}
+    with open(os.path.join(os.path.dirname(__file__), "saved_models", "norm_params.json"), "w", encoding='utf-8') as f:
+        json.dump(norm_params, f)
+    print(f"✅ Focal Loss 強化模型訓練完畢！")
 
 if __name__ == "__main__":
-    # 可在此讀入由交易所或外部資料庫下載的三大法人歷史 CSV 進行真實訓練
-    # ex: df_chips_history = pd.read_csv("institutional_daily.csv")
-    train_trading_model(df_daily_chips_input=None)
+    from data_engine import DayTradingDataEngine
+    engine = DayTradingDataEngine()
+
+    # 自動抓取過去 90 天的真實籌碼與買賣超！
+    df_real_chips = engine.fetch_real_historical_chips(days=90)
+
+    # 將真實籌碼傳入訓練引擎
+    train_trading_model(df_daily_chips_input=df_real_chips)
