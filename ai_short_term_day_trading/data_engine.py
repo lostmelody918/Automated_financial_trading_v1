@@ -195,48 +195,6 @@ class DayTradingDataEngine:
             print(f"❌ 成交量合約定位失敗: {e}")
             return self.api.Contracts.Futures.TXF.TXFR1
 
-    def integrate_institutional_chips(self, df_intraday, df_daily_chips):
-        """將三大法人日留倉籌碼特徵，無未來函數地融合至當沖 K 線數據中"""
-        df_chips = df_daily_chips.copy().sort_values('date').reset_index(drop=True)
-
-        df_chips['foreign_oi_zscore'] = (
-            df_chips['foreign_net_oi'] - df_chips['foreign_net_oi'].rolling(20).mean()
-        ) / (df_chips['foreign_net_oi'].rolling(20).std() + 1e-9)
-
-        df_chips['dealer_oi_zscore'] = (
-            df_chips['dealer_net_oi'] - df_chips['dealer_net_oi'].rolling(20).mean()
-        ) / (df_chips['dealer_net_oi'].rolling(20).std() + 1e-9)
-
-        df_chips['foreign_oi_momentum'] = df_chips['foreign_net_oi'].diff()
-        df_chips['dealer_oi_momentum'] = df_chips['dealer_net_oi'].diff()
-
-        if 'pc_ratio' in df_chips.columns:
-            df_chips['pc_ratio_momentum'] = df_chips['pc_ratio'].diff()
-
-        features_to_shift = [
-            'foreign_net_oi', 'dealer_net_oi',
-            'foreign_oi_zscore', 'dealer_oi_zscore',
-            'foreign_oi_momentum', 'dealer_oi_momentum'
-        ]
-        if 'pc_ratio' in df_chips.columns:
-            features_to_shift.extend(['pc_ratio', 'pc_ratio_momentum'])
-
-        df_chips[features_to_shift] = df_chips[features_to_shift].shift(1)
-        df_chips.dropna(subset=['foreign_oi_zscore'], inplace=True)
-
-        df_merged = pd.merge(
-            df_intraday,
-            df_chips[['date'] + [f for f in features_to_shift if f in df_chips.columns]],
-            left_on='date_only', right_on='date', how='left'
-        )
-
-        if 'date_y' in df_merged.columns:
-            df_merged.drop(columns=['date_y'], inplace=True)
-        df_merged.rename(columns={'date_x': 'date'}, inplace=True, errors='ignore')
-
-        df_merged[features_to_shift] = df_merged[features_to_shift].ffill()
-        return df_merged.dropna(subset=['foreign_oi_zscore']).reset_index(drop=True)
-
     def fetch_real_historical_chips(self, days=90):
         """
         🚀 自動向期交所與證交所抓取真實歷史籌碼 (完整健壯版)
@@ -294,7 +252,10 @@ class DayTradingDataEngine:
                 if r1.status_code == 200 and 'DOCTYPE html' not in r1.text[:100].upper() and 'alert' not in r1.text[:200]:
                     content_str = r1.content.decode('big5', errors='ignore')
                     if year_offset > 0: content_str = content_str.replace(str(e_date.year - year_offset), str(e_date.year))
-                    pc_frames.append(pd.read_csv(io.StringIO(content_str)))
+                    # 修正期交所 CSV 結尾逗號導致的欄位平移問題
+                    lines = [line.strip().rstrip(',') for line in content_str.split('\n') if line.strip()]
+                    content_str = '\n'.join(lines)
+                    pc_frames.append(pd.read_csv(io.StringIO(content_str), index_col=False))
 
                 time.sleep(1) # 增加延遲避免被封鎖
 
@@ -304,7 +265,10 @@ class DayTradingDataEngine:
                 if r2.status_code == 200 and 'DOCTYPE html' not in r2.text[:100].upper() and 'alert' not in r2.text[:200]:
                     content_str = r2.content.decode('big5', errors='ignore')
                     if year_offset > 0: content_str = content_str.replace(str(e_date.year - year_offset), str(e_date.year))
-                    oi_frames.append(pd.read_csv(io.StringIO(content_str)))
+                    # 修正期交所 CSV 結尾逗號導致的欄位平移問題
+                    lines = [line.strip().rstrip(',') for line in content_str.split('\n') if line.strip()]
+                    content_str = '\n'.join(lines)
+                    oi_frames.append(pd.read_csv(io.StringIO(content_str), index_col=False))
 
                 time.sleep(1) # 增加延遲避免被封鎖
             except Exception as e:
@@ -412,12 +376,32 @@ class DayTradingDataEngine:
                 df_chips[f'{col}_zscore'] = (df_chips[col] - df_chips[col].rolling(20).mean()) / (df_chips[col].rolling(20).std() + 1e-9)
                 df_chips[f'{col}_momentum'] = df_chips[col].diff()
 
-        # 3. 未來函數防禦：將籌碼指標 Shift(1)
-        shift_cols = [c for c in df_chips.columns if c != 'date']
-        df_chips[shift_cols] = df_chips[shift_cols].shift(1)
+        # 3. 未來函數防禦：將籌碼指標 Shift(1) (僅在非單日快照模式下執行)
+        if len(df_chips) > 1:
+            shift_cols = [c for c in df_chips.columns if c != 'date' and 'date' not in c]
+            df_chips[shift_cols] = df_chips[shift_cols].shift(1)
+        else:
+            print("ℹ️ [DataEngine] 偵測到單日籌碼快照，跳過 Shift(1) 以保留當前資訊。")
 
-        # 4. 合併數據 (Left Merge)
-        df_merged = df_intraday.merge(df_chips, left_on='date_only', right_on='date', how='left')
+        # 4. 合併數據 (使用 merge_asof 確保即使日期有落差也能抓到最新的一筆籌碼)
+        df_intraday = df_intraday.sort_values('date_only')
+        df_chips = df_chips.sort_values('date').dropna(subset=['date'])
+        
+        # 移除含有 NaT 的 date_only 以避免 merge_asof 報錯
+        df_intraday = df_intraday.dropna(subset=['date_only'])
+        
+        df_intraday['date_only_dt'] = pd.to_datetime(df_intraday['date_only'])
+        df_chips['date_dt'] = pd.to_datetime(df_chips['date'])
+        
+        df_merged = pd.merge_asof(
+            df_intraday, 
+            df_chips, 
+            left_on='date_only_dt', 
+            right_on='date_dt', 
+            direction='backward'
+        )
+        
+        df_merged.drop(columns=['date_only_dt', 'date_dt'], inplace=True, errors='ignore')
 
         # 5. 分層填補策略 (Layered Imputation Strategy)
         # 定義哪些指標是「水準值」，哪些是「變動量」
@@ -439,6 +423,10 @@ class DayTradingDataEngine:
 
         print(f"✅ 籌碼融合完成，最終資料筆數: {len(df_merged)}")
         # 輸出一下目前的空值檢查報告
+        null_count = df_merged.isnull().sum().sum()
+        print(f"ℹ️ 最終檢查：融合後資料集尚有 {null_count} 個空值 (正常情況應為 0)")
+
+        return df_merged.reset_index(drop=True)    # 輸出一下目前的空值檢查報告
         null_count = df_merged.isnull().sum().sum()
         print(f"ℹ️ 最終檢查：融合後資料集尚有 {null_count} 個空值 (正常情況應為 0)")
 

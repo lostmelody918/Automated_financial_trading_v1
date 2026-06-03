@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import pandas as pd
+pd.options.mode.string_storage = 'python' # Disable pyarrow to prevent Shioaji thread crash
+import pyarrow # Pre-load pyarrow to prevent access violation with Shioaji threads
 import numpy as np
 import os
 import json
@@ -60,20 +62,23 @@ def train_trading_model(df_daily_chips_input=None):
             df_feat[col] = np.sign(df_feat[col]) * np.log1p(np.abs(df_feat[col]))
 
     # ==========================================
-    # 🚀 突破口 B：穩健標準化 (Robust Scaling) - 完美保留黑天鵝極值
+    # 🚀 突破口 B：穩健標準化 (Robust Scaling) - 防止未來函數洩漏 (Look-ahead Bias)
     # ==========================================
-    # i.確保只對數值欄位操作 (防禦性程式設計)
+    # i. 確保只對數值欄位操作
     df_numeric = df_feat.select_dtypes(include=[np.number])
-    # ii.計算正規化參數
-    median = df_numeric.median()
-    iqr = df_numeric.quantile(0.75) - df_numeric.quantile(0.25)
-    # iii.防止除以 0 (如果某欄位數值完全沒變，IQR 會是 0)
+    
+    # ii. 切分訓練集與驗證集 (時間序列必須按順序切分，不能隨機 shuffle)
+    train_size = int(len(df_numeric) * 0.8)
+    df_train = df_numeric.iloc[:train_size]
+    
+    # iii. 僅使用訓練集的統計量來計算正規化參數
+    median = df_train.median()
+    iqr = df_train.quantile(0.75) - df_train.quantile(0.25)
     iqr = iqr.replace(0, 1.0)
-    # iv.執行正規化
+    
+    # iv. 執行正規化 (全體資料皆使用訓練集的參數)
     df_normalized = (df_numeric - median) / iqr
-    # v.後續模型輸入需要將非數值欄位補回來 (如果模型需要的話)
-    # 或者直接將 df_normalized 轉為 Tensor 進行訓練
-    df_normalized = df_normalized.fillna(0) # 確保填補掉計算後的 NaN
+    df_normalized = df_normalized.fillna(0)
 
     input_dim = df_normalized.shape[1]
     print(f"✅ 正規化完成，最終輸入特徵維度 (input_dim): {input_dim}")
@@ -88,11 +93,27 @@ def train_trading_model(df_daily_chips_input=None):
     df.dropna(subset=['future_max', 'future_min'], inplace=True)
     df_normalized = df_normalized.iloc[:len(df)]
 
-    THRESHOLD = 0.0015
+    T_L1 = 0.0010
+    T_L2 = 0.0020
+    T_L3 = 0.0035
+
     def classify_trend(row):
-        if row['max_up_ret'] > THRESHOLD and row['max_up_ret'] > row['max_down_ret']: return 2
-        if row['max_down_ret'] > THRESHOLD and row['max_down_ret'] > row['max_up_ret']: return 0
-        return 1
+        up = row['max_up_ret']
+        down = row['max_down_ret']
+        
+        # 0: Strong Down (-3), 1: Med Down (-2), 2: Weak Down (-1)
+        # 3: Hold (0)
+        # 4: Weak Up (1), 5: Med Up (2), 6: Strong Up (3)
+        if up > down:
+            if up > T_L3: return 6
+            if up > T_L2: return 5
+            if up > T_L1: return 4
+            return 3
+        else:
+            if down > T_L3: return 0
+            if down > T_L2: return 1
+            if down > T_L1: return 2
+            return 3
 
     df['label'] = df.apply(classify_trend, axis=1)
 

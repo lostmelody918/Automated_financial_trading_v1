@@ -164,8 +164,9 @@ def plot_dynamic_dashboard(df, feat1, feat2, feat3):
         hovermode="x unified",
         uirevision='constant' # 核心關鍵：保持重新渲染時的縮放比例與位置
     )
-    fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor='rgba(128,128,128,0.2)')
-    fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='rgba(128,128,128,0.2)')
+    # 加入 autorange=True 與 fixedrange=False，確保未來加入履約價選擇權時，切換合約能動態調整 X/Y 軸價格區間，避免比例失真
+    fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor='rgba(128,128,128,0.2)', autorange=True, fixedrange=False)
+    fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='rgba(128,128,128,0.2)', autorange=True, fixedrange=False)
     fig.update_yaxes(title_text="價格", row=1, col=1)
     fig.update_yaxes(title_text=", ".join(feat1) if feat1 else "", row=2, col=1)
     fig.update_yaxes(title_text=", ".join(feat2) if feat2 else "", row=3, col=1)
@@ -224,7 +225,7 @@ else:
 
             # --- 2. 渲染內容區塊 (圖表與數據切換) ---
             with content_placeholder.container():
-                tab1, tab2 = st.tabs(["📈 即時動態圖表", "🧩 特徵數據矩陣"])
+                tab1, tab2, tab3 = st.tabs(["📈 即時動態圖表", "🧩 特徵數據矩陣", "📚 歷史績效與複盤"])
                 
                 with tab1:
                     fig = plot_dynamic_dashboard(df_display, sub1_feat, sub2_feat, sub3_feat)
@@ -252,6 +253,188 @@ else:
                                               .format("{:.3f}")
                     
                     st.dataframe(styled_df, use_container_width=True, height=600)
+                
+                with tab3:
+                    st.markdown("### 📚 歷史績效與複盤")
+                    import glob
+                    import os
+                    import json
+                    
+                    base_path = "data_learn"
+                    if not os.path.exists(base_path):
+                        base_path = "../data_learn"
+                        if not os.path.exists(base_path):
+                            base_path = "F:/Gemini_CLI_Application/finance_v2/data_learn"
+                    
+                    report_files = glob.glob(os.path.join(base_path, "daily_trade_report_*.csv"))
+                    if not report_files:
+                        st.info("尚未找到任何歷史交易紀錄 (daily_trade_report_*.csv)。")
+                    else:
+                        dfs = []
+                        for f in report_files:
+                            try:
+                                dfs.append(pd.read_csv(f))
+                            except Exception:
+                                pass
+                        
+                        if dfs:
+                            df_hist = pd.concat(dfs, ignore_index=True)
+                            if 'pnl' in df_hist.columns:
+                                total_pnl = df_hist['pnl'].sum()
+                                max_dd = df_hist['pnl'].cumsum().cummax() - df_hist['pnl'].cumsum()
+                                mdd = max_dd.max() if not max_dd.empty else 0
+                                
+                                gross_profit = df_hist[df_hist['pnl'] > 0]['pnl'].sum()
+                                gross_loss = abs(df_hist[df_hist['pnl'] < 0]['pnl'].sum())
+                                profit_factor = (gross_profit / gross_loss) if gross_loss != 0 else float('inf')
+                                
+                                avg_win = df_hist[df_hist['pnl'] > 0]['pnl'].mean()
+                                avg_loss = abs(df_hist[df_hist['pnl'] < 0]['pnl'].mean())
+                                risk_reward = (avg_win / avg_loss) if avg_loss != 0 else float('inf')
+                                
+                                win_rate = len(df_hist[df_hist['pnl'] > 0]) / len(df_hist) if len(df_hist) > 0 else 0
+                                
+                                hc1, hc2, hc3, hc4 = st.columns(4)
+                                hc1.metric("Maximum Drawdown (MDD)", f"{mdd:,.0f}")
+                                hc2.metric("Profit Factor", f"{profit_factor:.2f}")
+                                hc3.metric("Risk-Reward Ratio", f"{risk_reward:.2f}")
+                                hc4.metric("Win Rate", f"{win_rate*100:.1f}%")
+                                
+                                st.markdown("#### 📅 勝率熱力圖 (星期 vs 小時)")
+                                if 'entry_time' in df_hist.columns:
+                                    df_hist['entry_time'] = pd.to_datetime(df_hist['entry_time'], errors='coerce')
+                                    df_hist_valid = df_hist.dropna(subset=['entry_time']).copy()
+                                    if not df_hist_valid.empty:
+                                        df_hist_valid['hour'] = df_hist_valid['entry_time'].dt.hour
+                                        df_hist_valid['day_of_week'] = df_hist_valid['entry_time'].dt.dayofweek
+                                        df_hist_valid['is_win'] = (df_hist_valid['pnl'] > 0).astype(int)
+                                        
+                                        pivot = df_hist_valid.pivot_table(index='day_of_week', columns='hour', values='is_win', aggfunc='mean')
+                                        day_names = {0:'一', 1:'二', 2:'三', 3:'四', 4:'五', 5:'六', 6:'日'}
+                                        pivot.index = pivot.index.map(day_names)
+                                        
+                                        fig_hm = go.Figure(data=go.Heatmap(
+                                            z=pivot.values,
+                                            x=pivot.columns,
+                                            y=pivot.index,
+                                            colorscale='RdYlGn',
+                                            zmin=0, zmax=1
+                                        ))
+                                        fig_hm.update_layout(title='各時段勝率分布', xaxis_title='小時', yaxis_title='星期')
+                                        st.plotly_chart(fig_hm, use_container_width=True)
+                                
+                                st.markdown("#### 🔍 SHAP 虧損深度分析")
+                                col_btn1, col_btn2 = st.columns(2)
+                                
+                                do_shap = False
+                                target_dir = None
+                                
+                                if col_btn1.button("執行多單虧損 SHAP 分析"):
+                                    do_shap = True
+                                    target_dir = 'long'
+                                if col_btn2.button("執行空單虧損 SHAP 分析"):
+                                    do_shap = True
+                                    target_dir = 'short'
+                                    
+                                if do_shap:
+                                    import torch
+                                    import shap
+                                    import matplotlib.pyplot as plt
+                                    import sys
+                                    
+                                    curr_dir = os.path.dirname(__file__) if '__file__' in globals() else os.getcwd()
+                                    if curr_dir not in sys.path:
+                                        sys.path.append(curr_dir)
+                                        
+                                    try:
+                                        from composite_ai import CompositeDayTradingAI
+                                    except ImportError:
+                                        sys.path.append("F:/Gemini_CLI_Application/finance_v2/ai_short_term_day_trading")
+                                        from composite_ai import CompositeDayTradingAI
+                                    
+                                    with st.spinner(f"正在執行 {target_dir} SHAP 分析..."):
+                                        dir_series = df_hist['direction'].fillna('').str.lower()
+                                        if target_dir == 'long':
+                                            mask_dir = dir_series.str.contains('long') | dir_series.str.contains('call')
+                                        else:
+                                            mask_dir = dir_series.str.contains('short') | dir_series.str.contains('put')
+                                            
+                                        df_loss = df_hist[(df_hist['pnl'] < 0) & mask_dir].copy()
+                                        
+                                        if len(df_loss) == 0:
+                                            st.warning(f"沒有找到符合條件的 {target_dir} 虧損紀錄。")
+                                        else:
+                                            try:
+                                                model_dir = "saved_models"
+                                                if not os.path.exists(model_dir):
+                                                    model_dir = "../saved_models"
+                                                    if not os.path.exists(model_dir):
+                                                        model_dir = "F:/Gemini_CLI_Application/finance_v2/ai_short_term_day_trading/saved_models"
+                                                
+                                                with open(os.path.join(model_dir, "norm_params.json"), "r", encoding='utf-8') as f:
+                                                    norm_params = json.load(f)
+                                                    
+                                                feature_cols = [c for c in norm_params['feature_cols'] if c in norm_params['mean']]
+                                                
+                                                model_files = glob.glob(os.path.join(model_dir, "trading_model_*.pth"))
+                                                if not model_files:
+                                                    st.error("找不到任何模型檔 (.pth)")
+                                                else:
+                                                    latest_model_path = max(model_files, key=os.path.getctime)
+                                                    
+                                                    # 讀取對應的 metadata 來取得 hyperparameter
+                                                    meta_path = latest_model_path.replace('.pth', '_metadata.json')
+                                                    window_size = 40
+                                                    d_model = 256
+                                                    nhead = 16
+                                                    num_layers = 4
+                                                    
+                                                    if os.path.exists(meta_path):
+                                                        with open(meta_path, 'r', encoding='utf-8') as f:
+                                                            meta = json.load(f)
+                                                            if "experiment_info" in meta and "hyperparameters" in meta["experiment_info"]:
+                                                                hp = meta["experiment_info"]["hyperparameters"]
+                                                                window_size = hp.get('window_size', 40)
+                                                                d_model = hp.get('d_model', 256)
+                                                                nhead = hp.get('nhead', 16)
+                                                                num_layers = hp.get('num_layers', 4)
+                                                    
+                                                    ai_model = CompositeDayTradingAI(input_dim=len(feature_cols), d_model=d_model, nhead=nhead, num_layers=num_layers)
+                                                    checkpoint = torch.load(latest_model_path, map_location='cpu', weights_only=True)
+                                                    ai_model.load_state_dict(checkpoint['model_state_dict'])
+                                                    ai_model.eval()
+                                                    
+                                                    df_loss = df_loss.head(100)
+                                                    X_list = []
+                                                    for idx, row in df_loss.iterrows():
+                                                        row_feat = []
+                                                        for col in feature_cols:
+                                                            feat_name = f"feat_{col}"
+                                                            val = float(row[feat_name]) if feat_name in row and pd.notnull(row[feat_name]) else 0.0
+                                                            row_feat.append(val)
+                                                        X_list.append([row_feat] * window_size)
+                                                    
+                                                    X_tensor = torch.tensor(X_list, dtype=torch.float32)
+                                                    background = torch.zeros((1, window_size, len(feature_cols)), dtype=torch.float32)
+                                                    
+                                                    explainer = shap.GradientExplainer(ai_model, background)
+                                                    shap_values = explainer.shap_values(X_tensor)
+                                                    
+                                                    if isinstance(shap_values, list):
+                                                        shap_vals = shap_values[0]
+                                                    else:
+                                                        shap_vals = shap_values
+                                                        
+                                                    shap_vals_last_step = shap_vals[:, -1, :]
+                                                    X_tensor_last_step = X_tensor[:, -1, :].numpy()
+                                                    
+                                                    fig_shap = plt.figure()
+                                                    shap.summary_plot(shap_vals_last_step, X_tensor_last_step, feature_names=feature_cols, show=False)
+                                                    st.pyplot(fig_shap)
+                                                    plt.close(fig_shap)
+                                                    
+                                            except Exception as e:
+                                                st.error(f"SHAP 分析過程發生錯誤: {e}")
 
         except Exception as e:
             st.error(f"❌ 資料更新發生錯誤: {str(e)}")
