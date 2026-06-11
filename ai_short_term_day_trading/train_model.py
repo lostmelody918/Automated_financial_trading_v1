@@ -19,7 +19,7 @@ def train_trading_model(df_daily_chips_input=None):
 
     engine = DayTradingDataEngine()
     print("📥 下載台指期貨歷史 K 線進行 AI 訓練...")
-    df_raw = engine.fetch_intraday_data(days=60)
+    df_raw = engine.fetch_intraday_data(days=180)
 
     # 必須在這裡先定義 window_size，否則後面的檢查會報錯
     window_size = 40
@@ -249,8 +249,8 @@ if __name__ == "__main__":
     from data_engine import DayTradingDataEngine
     engine = DayTradingDataEngine()
 
-    # 自動抓取過去 90 天的真實籌碼與買賣超！
-    df_real_chips = engine.fetch_real_historical_chips(days=90)
+    # 自動抓取過去 180 天的真實籌碼與買賣超！
+    df_real_chips = engine.fetch_real_historical_chips(days=180)
 
     # 將真實籌碼傳入訓練引擎
     train_trading_model(df_daily_chips_input=df_real_chips)

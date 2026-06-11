@@ -19,8 +19,7 @@ from data_engine import DayTradingDataEngine
 from composite_ai import CompositeDayTradingAI
 from model_manager import TradingModelManager
 from strategy_factory import StrategyFactory
-from delta_gamma_theta import get_dynamic_bsm_bounds
-from get_api_based_dte import get_api_based_dte
+from delta_gamma_theta import get_dynamic_bsm_bounds, get_api_based_dte
 
 # ==========================================
 # 核心參數設定
@@ -30,7 +29,6 @@ CONTRACT_MULTIPLIER = 50
 FEE_SLIPPAGE_PER_CONTRACT = 100
 MAX_POSITION_CAPITAL = 4000000
 WINDOW_SIZE = 40
-BID_ASK_SPREAD_THRESHOLD = 5.0
 
 class PositionManager:
     def __init__(self, db_path="position_state.db"):
@@ -134,8 +132,13 @@ class KBarAccumulator:
 def is_market_open(current_time):
     return datetime_time(8, 45) <= current_time <= datetime_time(13, 45)
 
-def is_eod_closing_time(current_time):
-    return datetime_time(13, 40) <= current_time < datetime_time(13, 45)
+def is_eod_closing_time(now_dt, is_settlement=False):
+    current_time = now_dt.time() if hasattr(now_dt, 'time') else now_dt
+    if is_settlement:
+        # 當日到期結算日，提早到 13:15 強制平倉了結，避免過度深入結算平均價計算期
+        return datetime_time(13, 15) <= current_time < datetime_time(13, 45)
+    # 非交割日：13:25 之後波動太小且時間價值流失快，提早到 13:25 強制平倉/不進場
+    return datetime_time(13, 25) <= current_time < datetime_time(13, 45)
 
 def load_latest_daily_chips_snapshot():
     print("📥 載入本地籌碼快照 (chips_cache.json)...")
@@ -211,6 +214,43 @@ def calculate_features(df_raw):
     rs = gain / (loss + 1e-9)
     df['rsi'] = 100 - (100 / (1 + rs))
 
+    gain_fast = (delta.where(delta > 0, 0)).rolling(window=3).mean()
+    loss_fast = (-delta.where(delta < 0, 0)).rolling(window=3).mean()
+    rs_fast = gain_fast / (loss_fast + 1e-9)
+    df['rsi_fast'] = 100 - (100 / (1 + rs_fast))
+
+    df['body_length'] = abs(df['Close'] - df['Open'])
+    df['upper_shadow'] = df['High'] - df[['Open', 'Close']].max(axis=1)
+    df['lower_shadow'] = df[['Open', 'Close']].min(axis=1) - df['Low']
+
+    df['body_avg_5'] = df['body_length'].rolling(5).mean()
+    df['momentum_explosion'] = (df['body_length'] > df['body_avg_5']).astype(int)
+
+    df['daily_open'] = df.groupby('date_only')['Open'].transform('first')
+
+    daily_close = df.groupby('date_only')['Close'].last().shift(1)
+    df['yesterday_close'] = df['date_only'].map(daily_close)
+    df['yesterday_close'] = df['yesterday_close'].fillna(df['daily_open'])
+
+    df['gap_amplitude'] = (df['daily_open'] - df['yesterday_close']) / (df['yesterday_close'] + 1e-9)
+    df['intraday_trend'] = (df['Close'] - df['daily_open']) / (df['daily_open'] + 1e-9)
+
+    # 均值回歸與突破輔助特徵 (Mean Reversion / Breakout Aux)
+    # 1. 乖離均線 (Distance from MA) - 判斷拉回深度
+    df['dist_from_ma20'] = (df['Close'] - df['Close'].rolling(20).mean()) / (df['Close'].rolling(20).mean() + 1e-9)
+
+    # 2. 區間高低點回撤 (Pullback Depth) - 判斷目前是創高還是拉回
+    df['recent_high_20'] = df['High'].rolling(20).max()
+    df['recent_low_20'] = df['Low'].rolling(20).min()
+    df['pullback_from_high'] = (df['Close'] - df['recent_high_20']) / (df['recent_high_20'] + 1e-9)
+    df['bounce_from_low'] = (df['Close'] - df['recent_low_20']) / (df['recent_low_20'] + 1e-9)
+
+    df['gap_filled'] = 0
+    df.loc[(df['gap_amplitude'] > 0) & (df['Close'] <= df['yesterday_close']), 'gap_filled'] = 1
+    df.loc[(df['gap_amplitude'] < 0) & (df['Close'] >= df['yesterday_close']), 'gap_filled'] = 1
+
+    df['spot_futures_proxy'] = (df['Close'] - df['vwap']) / (df['Close'].rolling(20).mean() + 1e-9)
+
     df['sma20'] = df['Close'].rolling(window=20).mean()
     df['std20'] = df['Close'].rolling(window=20).std()
     df['bb_upper'] = df['sma20'] + (df['std20'] * 2)
@@ -254,8 +294,54 @@ def run_live_simulator():
     # Initialize Position Manager
     pos_manager = PositionManager(os.path.join(os.path.dirname(__file__), "position_state.db"))
 
+    current_active_code = None
+
+    # 啟動時檢查：若有遺留的未平倉部位，進行跨日清除或當日恢復訂閱
+    entry_time_str = pos_manager.get('entry_time')
+    if pos_manager.get('position') != 0 and entry_time_str:
+        try:
+            entry_date = datetime.strptime(entry_time_str, "%Y-%m-%d %H:%M:%S").date()
+            active_contract_symbol = pos_manager.get('active_contract_symbol')
+            if entry_date != datetime.now().date():
+                print(f"🧹 發現跨日未平倉部位 ({active_contract_symbol})，自動清除以確保當沖邏輯！")
+                pos_manager.clear_position()
+            else:
+                # 這是今天的部位！必須重新訂閱它的行情才能繼續追蹤平倉
+                print(f"🔄 偵測到今日未平倉部位 ({active_contract_symbol})，準備重新訂閱行情...")
+                active_contract_obj = None
+                for cat in ['TXO', 'TX1', 'TX2', 'TX4', 'TX5', 'TXU', 'TXV', 'TXX']:
+                    if hasattr(engine.api.Contracts.Options, cat):
+                        for c in getattr(engine.api.Contracts.Options, cat):
+                            if c.symbol == active_contract_symbol:
+                                active_contract_obj = c
+                                break
+                    if active_contract_obj:
+                        break
+
+                if active_contract_obj:
+                    try:
+                        engine.api.quote.subscribe(active_contract_obj, quote_type=sj.constant.QuoteType.Tick)
+                        engine.api.quote.subscribe(active_contract_obj, quote_type=sj.constant.QuoteType.BidAsk)
+                        current_active_code = active_contract_obj.code
+                        print(f"✅ 成功重新訂閱 {active_contract_symbol} (Code: {current_active_code}) 行情，繼續監控平倉條件！")
+                    except Exception as e:
+                        print(f"⚠️ 重新訂閱失敗: {e}，強制清除部位！")
+                        pos_manager.clear_position()
+                else:
+                    print(f"⚠️ 無法找到未平倉部位 ({active_contract_symbol}) 的合約物件，強制清除部位！")
+                    pos_manager.clear_position()
+        except Exception as e:
+            print(f"⚠️ 解析遺留部位發生錯誤 ({e})，強制清除部位！")
+            pos_manager.clear_position()
+
     current_capital = INITIAL_CAPITAL
     last_trade_win = False
+    consecutive_failures = {'Call': 0, 'Put': 0}
+    consecutive_total_losses = 0
+    cooldown_until = None
+    last_trade_symbol = None
+    last_trade_closed_time = None
+    last_trade_pnl = 0.0
     trade_log = []
     eod_report_done = False
     entry_features = {}
@@ -292,50 +378,82 @@ def run_live_simulator():
                 volume = getattr(tick, 'volume', 1)
                 event_queue.put(('TXF_TICK', now, float(price), int(volume)))
             else:
-                bid = 0; ask = 0
-                event_queue.put(('OPT_TICK', symbol, now, float(price), float(bid), float(ask)))
+                # 這裡不一定有最佳買賣價，我們主要靠 on_bidask_fop_v1_callback 更新
+                # 但如果這裡有帶，還是送進去更新 price
+                event_queue.put(('OPT_TICK', symbol, now, float(price), 0.0, 0.0))
         except Exception as e:
-            pass
+            print(f"⚠️ on_tick_fop_callback 錯誤: {e}")
+
+    def on_bidask_fop_v1_callback(exchange, bidask):
+        try:
+            symbol = getattr(bidask, 'code', None)
+            if not symbol: return
+            now = datetime.now()
+
+            # Shioaji 的 BidAsk 物件有 bid_price / ask_price 陣列 (Decimals)
+            bids = getattr(bidask, 'bid_price', [])
+            asks = getattr(bidask, 'ask_price', [])
+
+            bid = float(bids[0]) if bids and len(bids) > 0 else 0.0
+            ask = float(asks[0]) if asks and len(asks) > 0 else 0.0
+
+            # 發送更新，由於 BidAsk 沒有成交價，price 代 0.0 (主迴圈會忽略 price=0 的更新，只更新 bid/ask)
+            event_queue.put(('OPT_TICK', symbol, now, 0.0, float(bid), float(ask)))
+        except Exception as e:
+            print(f"⚠️ on_bidask_fop_v1_callback 錯誤: {e}")
 
     def quote_callback(topic, quote):
         try:
             symbol = topic.split('/')[-1]
             now = datetime.now()
 
-            # 支援多種 Shioaji 版本屬性
             price = getattr(quote, 'close', getattr(quote, 'Close', None))
-            if price is None: return
+            bid_prices = getattr(quote, 'BidPrice', getattr(quote, 'bid_price', []))
+            ask_prices = getattr(quote, 'AskPrice', getattr(quote, 'ask_price', []))
+
+            # 如果沒有 price 但有買賣價，這可能是一個單純的委託簿更新
+            if price is None and not (bid_prices or ask_prices): return
 
             if "TXF" in symbol:
-                volume = getattr(quote, 'volume', getattr(quote, 'Volume', 1))
-                event_queue.put(('TXF_TICK', now, float(price), int(volume)))
+                if price is not None:
+                    volume = getattr(quote, 'volume', getattr(quote, 'Volume', 1))
+                    event_queue.put(('TXF_TICK', now, float(price), int(volume)))
             else:
-                bid = 0; ask = 0
-                bid_prices = getattr(quote, 'BidPrice', getattr(quote, 'bid_price', []))
-                ask_prices = getattr(quote, 'AskPrice', getattr(quote, 'ask_price', []))
-                if bid_prices: bid = bid_prices[0]
-                if ask_prices: ask = ask_prices[0]
-                event_queue.put(('OPT_TICK', symbol, now, float(price), float(bid), float(ask)))
+                bid = float(bid_prices[0]) if bid_prices else 0.0
+                ask = float(ask_prices[0]) if ask_prices else 0.0
+                p = float(price) if price is not None else 0.0
+                event_queue.put(('OPT_TICK', symbol, now, p, bid, ask))
         except Exception as e:
-            pass
+            print(f"⚠️ quote_callback 錯誤: {e}")
 
     try:
         # 兼容不同版本的 Shioaji API
         if hasattr(engine.api.quote, 'set_on_tick_fop_v1_callback'):
             engine.api.quote.set_on_tick_fop_v1_callback(on_tick_fop_callback)
-        elif hasattr(engine.api.quote, 'set_on_tick_fnc'):
+
+        if hasattr(engine.api.quote, 'set_on_bidask_fop_v1_callback'):
+            engine.api.quote.set_on_bidask_fop_v1_callback(on_bidask_fop_v1_callback)
+
+        if hasattr(engine.api.quote, 'set_on_tick_fnc'):
             engine.api.quote.set_on_tick_fnc(quote_callback)
         elif hasattr(engine.api.quote, 'set_quote_callback'):
             engine.api.quote.set_quote_callback(quote_callback)
         elif hasattr(engine.api, 'on_tick'):
             engine.api.on_tick(quote_callback)
 
-        engine.api.quote.subscribe(txf_contract, quote_type=sj.constant.QuoteType.Tick)
+        # 確保以 v1 版本訂閱 Tick 與 BidAsk
+        if hasattr(sj.constant, 'QuoteVersion'):
+            engine.api.quote.subscribe(txf_contract, quote_type=sj.constant.QuoteType.Tick, version=sj.constant.QuoteVersion.v1)
+            engine.api.quote.subscribe(txf_contract, quote_type=sj.constant.QuoteType.BidAsk, version=sj.constant.QuoteVersion.v1)
+        else:
+            engine.api.quote.subscribe(txf_contract, quote_type=sj.constant.QuoteType.Tick)
     except Exception as e:
         print(f"⚠️ 訂閱失敗或 API 版本不相容: {e}")
 
     print("✅ 事件驅動引擎啟動，進入主迴圈...")
     last_print_time = datetime.now()
+    heartbeat_time = datetime.now()
+    is_today_settlement = None
 
     while True:
         now = datetime.now()
@@ -348,19 +466,32 @@ def run_live_simulator():
             if eod_report_done and current_time < datetime_time(8, 45):
                 eod_report_done = False
                 trade_log = []
+                is_today_settlement = None
 
             # 改進：非交易時段不要卡死 60 秒，讓迴圈能快速響應開盤
             try:
                 event = event_queue.get(timeout=5.0)
                 # 即使是非交易時段，若有 Tick 也要處理（例如盤後或開盤前五分鐘）
             except queue.Empty:
-                if (datetime.now() - last_print_time).total_seconds() > 60:
+                if (datetime.now() - heartbeat_time).total_seconds() > 60:
                     print(f"[{time_str}] 💤 非交易時段，等待日盤開盤 (08:45)...")
-                    last_print_time = datetime.now()
+                    heartbeat_time = datetime.now()
                 time.sleep(1)
                 continue
 
-        if is_eod_closing_time(current_time) and pos_manager.get('position') == 0 and not eod_report_done:
+        if is_today_settlement is None and is_market_open(current_time):
+            try:
+                temp_contract = engine.get_best_volume_option_contract(option_type='Call', allocated_capital=100000)
+                if temp_contract:
+                    is_today_settlement = (get_api_based_dte(temp_contract, now) < 1.0)
+                    print(f"[{time_str}] 📅 今日結算狀態: {is_today_settlement} (參考合約交割日: {getattr(temp_contract, 'delivery_date', 'N/A')})")
+                else:
+                    is_today_settlement = False
+            except Exception as e:
+                print(f"⚠️ 無法判斷結算日: {e}")
+                is_today_settlement = False
+
+        if is_eod_closing_time(now, is_settlement=is_today_settlement) and pos_manager.get('position') == 0 and not eod_report_done:
             generate_eod_report(trade_log, INITIAL_CAPITAL, current_capital)
             eod_report_done = True
             time.sleep(300)
@@ -389,6 +520,10 @@ def run_live_simulator():
                     if df is None or df.empty or len(df) < WINDOW_SIZE:
                         continue
 
+                    for missing_col in feature_cols:
+                        if missing_col not in df.columns:
+                            df[missing_col] = 0.0
+
                     df_slice = df[feature_cols].tail(WINDOW_SIZE).copy()
                     for col in ['mock_volume', 'macd_hist', 'vwap_bias']:
                         if col in df_slice.columns:
@@ -408,29 +543,90 @@ def run_live_simulator():
                         4: "Weak Up (1)", 5: "Med Up (2)", 6: "Strong Up (3)"
                     }
                     class_name = class_names.get(max_idx, "Unknown")
-                    print(f"[{time_str}] 🤖 AI 預測完成: Class={max_idx-3} ({class_name}), Confidence={confidence:.2%}, Probs={np.round(probs, 3)}")
+
+                    pos = pos_manager.get('position')
+                    if pos != 0:
+                        sym = pos_manager.get('active_contract_symbol')
+                        ep = pos_manager.get('entry_price')
+                        hp = pos_manager.get('highest_price_since_entry')
+                        sl = pos_manager.get('hard_sl_price')
+                        tp = pos_manager.get('hard_tp_price')
+
+                        quote_data = opt_quotes.get(current_active_code, {}) if current_active_code else {}
+                        current_opt_price = quote_data.get('price', 0)
+                        if not current_opt_price or current_opt_price <= 0:
+                            bid = quote_data.get('bid', 0)
+                            ask = quote_data.get('ask', 0)
+                            if bid > 0 and ask > 0:
+                                current_opt_price = round((bid + ask) / 2, 1)
+                            else:
+                                current_opt_price = 'N/A'
+
+                        print(f"[{time_str}] 🤖 AI 預測完成: Class={max_idx-3} ({class_name}), Confidence={confidence:.2%} | 📊 持倉: {sym} (現價: {current_opt_price}, 進: {ep}, 高: {hp}, 防: {sl:.1f}, 利: {tp})")
+                    else:
+                        print(f"[{time_str}] 🤖 AI 預測完成: Class={max_idx-3} ({class_name}), Confidence={confidence:.2%}, Probs={np.round(probs, 3)}")
 
                     # --- Entry Logic ---
-                    if pos_manager.get('position') == 0 and not is_eod_closing_time(current_time):
-                        # 提前計算 DTE 判斷是否為結算日
-                        dte_days_futures = get_api_based_dte(txf_contract, now)
-                        is_settlement_day = dte_days_futures < 1.0
+                    if pos_manager.get('position') == 0 and not is_eod_closing_time(now, is_settlement=is_today_settlement):
+                        if cooldown_until and now < cooldown_until:
+                            continue
+                        elif cooldown_until and now >= cooldown_until:
+                            cooldown_until = None
+                            consecutive_total_losses = 0
+                            print(f"[{time_str}] 🟢 冷卻時間結束，恢復交易！")
+
+                        signal = strategy_engine.generate_signal(df, ai_score=probs, last_win=last_trade_win)
+
+                        # 先決定潛在的交易方向，以便提前抓取合約
+                        temp_opt_type = 'Call'
+                        if signal != 0:
+                            temp_opt_type = 'Call' if signal > 0 else 'Put'
+
+                            # 連續虧損 2 次防護 (冷卻一次)
+                            if consecutive_failures[temp_opt_type] >= 2:
+                                print(f"[{time_str}] ⚠️ {temp_opt_type} 方向已連續虧損 2 次，觸發冷卻機制，本次放棄進場！")
+                                consecutive_failures[temp_opt_type] = 0 # 放棄一次後重置
+                                continue
+                        else:
+                            trend_probs = probs.copy()
+                            trend_probs[3] = 0
+                            max_trend_idx = int(np.argmax(trend_probs))
+                            temp_opt_type = 'Call' if max_trend_idx > 3 else 'Put'
+
+                        allocated_capital_limit = min(current_capital * 0.50, MAX_POSITION_CAPITAL)
+                        active_contract = engine.get_best_volume_option_contract(option_type=temp_opt_type, allocated_capital=allocated_capital_limit)
+
+                        if not active_contract:
+                            continue
+
+                        # 反手交易邏輯 (Reversal Logic)
+                        opt_type = temp_opt_type
+                        if last_trade_symbol == active_contract.symbol and last_trade_pnl < 0 and last_trade_closed_time:
+                            if (now - last_trade_closed_time).total_seconds() <= 120: # 2分鐘內
+                                print(f"[{time_str}] 🔄 【反向進場觸發】發現與上次停損合約相同 ({active_contract.symbol}) 且距離平倉小於 2 分鐘，執行反手！")
+                                opt_type = 'Put' if temp_opt_type == 'Call' else 'Call'
+                                active_contract = engine.get_best_volume_option_contract(option_type=opt_type, allocated_capital=allocated_capital_limit)
+                                if not active_contract:
+                                    continue
+                                # 反轉信號
+                                signal = -signal if signal != 0 else (1 if opt_type == 'Call' else -1)
+
+                        # 針對「真正的選擇權合約」計算 DTE
+                        dte_days_option = get_api_based_dte(active_contract, now)
+                        is_settlement_day = dte_days_option < 1.0
 
                         # 計算動態持有時間 (針對結算日縮短預期，加速獲利了結或停損)
                         expected_hold_time = 2.0
                         if is_settlement_day:
-                            if current_time >= datetime_time(13, 0):
+                            if current_time >= datetime_time(13, 15):
                                 expected_hold_time = 0.25
                             elif current_time >= datetime_time(12, 30):
                                 expected_hold_time = 0.5
                             else:
                                 expected_hold_time = 1.0
 
-                        signal = strategy_engine.generate_signal(df, ai_score=probs, last_win=last_trade_win)
-
                         # 降低門檻機制：即使 AI 預測最強類別是 Hold (0)，但若有其他趨勢類別達到指定信心度，則強制進場
                         if signal == 0:
-                            # 找出非 Hold 類別中機率最高者
                             trend_probs = probs.copy()
                             trend_probs[3] = 0 # 排除 Hold 類別
                             max_trend_idx = int(np.argmax(trend_probs))
@@ -443,60 +639,85 @@ def run_live_simulator():
                                 threshold = 0.25 # Level 2 標準波段降低至 25%
                             else:
                                 threshold = 0.20 # Level 1 短線游擊降低至 20% (從0.22微降)
-                                
+
                             # 依據預期持倉時間動態提高門檻 (時間越短，容錯率越低，要求更高的爆發力)
                             if expected_hold_time <= 0.25:
-                                threshold += 0.15 # 剩餘 15 分鐘，門檻大幅提高 15%
+                                threshold += 0.12 # 剩餘 15 分鐘，門檻大幅提高 15%
                             elif expected_hold_time <= 0.5:
-                                threshold += 0.10 # 剩餘 30 分鐘，門檻提高 10%
+                                threshold += 0.07 # 剩餘 30 分鐘，門檻提高 10%
                             elif expected_hold_time <= 1.0:
-                                threshold += 0.05 # 剩餘 1 小時，門檻提高 5%
+                                threshold += 0.03 # 剩餘 1 小時，門檻提高 5%
 
                             if trend_probs[max_trend_idx] > threshold:
                                 mapping = {0:-3, 1:-2, 2:-1, 3:0, 4:1, 5:2, 6:3}
                                 signal = mapping.get(max_trend_idx, 0)
                                 if signal != 0:
                                     print(f"[{time_str}] ⚠️ 觸發激進短線門檻：偵測到 Level {abs_level} 趨勢 (Class {max_trend_idx-3}), Prob={trend_probs[max_trend_idx]:.2%} > 動態門檻 {threshold:.2%} (預期持倉 {expected_hold_time}h)")
+                            elif trend_probs[max_trend_idx] > 0.15:
+                                # 只印出較有機會但不夠門檻的，避免洗版
+                                print(f"[{time_str}] ℹ️ 趨勢訊號不足門檻：Level {abs_level} (Class {max_trend_idx-3}), Prob={trend_probs[max_trend_idx]:.2%} <= 門檻 {threshold:.2%} (預期持倉 {expected_hold_time}h)")
 
                         if signal != 0:
                             opt_type = 'Call' if signal > 0 else 'Put'
-                            allocated_capital_limit = min(current_capital * 0.50, MAX_POSITION_CAPITAL)
-
-                            active_contract = engine.get_best_volume_option_contract(option_type=opt_type, allocated_capital=allocated_capital_limit)
-                            if not active_contract:
-                                continue
-
                             try:
                                 snap = engine.api.snapshots([active_contract])[0]
 
                                 # 吃單成本修正：進場買入 (Long) 時應支付 Best Ask (賣價)
                                 # 這裡假設 best_ask 存在於快照中
-                                best_bid = snap.buy_price if hasattr(snap, 'buy_price') else (snap.bids[0].price if hasattr(snap, 'bids') and snap.bids else 0)
-                                best_ask = snap.sell_price if hasattr(snap, 'sell_price') else (snap.asks[0].price if hasattr(snap, 'asks') and snap.asks else 0)
+                                best_bid = getattr(snap, 'buy_price', 0)
+                                if not best_bid and hasattr(snap, 'bids') and snap.bids:
+                                    best_bid = snap.bids[0].price
+                                best_ask = getattr(snap, 'sell_price', 0)
+                                if not best_ask and hasattr(snap, 'asks') and snap.asks:
+                                    best_ask = snap.asks[0].price
 
-                                if best_ask <= 0:
-                                    print(f"⚠️ {active_contract.symbol} 無效委賣價 (Best Ask={best_ask})，放棄進場！")
+                                if best_ask < 5:
+                                    print(f"⚠️ {active_contract.symbol} 權利金過低 (Best Ask={best_ask} < 5)，放棄進場！")
                                     continue
 
                                 entry_price = best_ask # 實際成交在賣價
 
-                                if best_ask > 0 and best_bid > 0 and (best_ask - best_bid) > BID_ASK_SPREAD_THRESHOLD:
-                                    print(f"⚠️ {active_contract.symbol} 買賣價差過大 ({best_ask} - {best_bid} = {best_ask-best_bid} > {BID_ASK_SPREAD_THRESHOLD})，放棄進場！")
+                                # 獲取當前波動率 (ATR) 以調整價差容忍度
+                                current_atr = df_intraday['atr'].iloc[-1]
+                                # 假設一般 ATR 約為 15-20。如果大於 25，視為高波動；大於 35 視為極端波動
+                                vol_multiplier = 1.0
+                                if current_atr > 35:
+                                    vol_multiplier = 2.0
+                                elif current_atr > 25:
+                                    vol_multiplier = 1.5
+
+                                # 導入階梯式百分比價差過濾機制，拒絕惡意價差與瞬間抽單
+                                if best_ask < 50:
+                                    # 低價位：允許最大 2.0 點 或 5% (最高 2.5點)
+                                    dynamic_spread_threshold = max(2.0, best_ask * 0.05) * vol_multiplier
+                                elif best_ask < 100:
+                                    # 中價位：允許最大 3.0 點 或 4% (最高 4.0點)
+                                    dynamic_spread_threshold = max(3.0, best_ask * 0.04) * vol_multiplier
+                                else:
+                                    # 高價位 (破百點)：嚴格限制在 3% 或最低 5.0 點，避免抽單瞬間蒸發
+                                    # 加上波動率調整，極端殺盤時最高容忍可達 10 點以上
+                                    dynamic_spread_threshold = max(5.0, best_ask * 0.03) * vol_multiplier
+
+                                if best_ask > 0 and best_bid > 0 and (best_ask - best_bid) > dynamic_spread_threshold:
+                                    print(f"⚠️ {active_contract.symbol} 買賣價差過大 ({best_ask} - {best_bid} = {best_ask-best_bid:.1f} > {dynamic_spread_threshold:.1f}，ATR={current_atr:.1f})，放棄進場！")
                                     continue
 
                             except Exception as e:
                                 print(f"獲取快照失敗: {e}")
                                 continue
 
-                            abs_sig = abs(signal)
-                            if abs_sig == 3:
-                                tp_mult, sl_mult = 5.0, 1.5
+                            abs_sig = abs(signal)  #停利/停損乘數
+                            if abs_sig == 10:
+                                tp_mult, sl_mult = 2.5, 1.5
+                                strategy_label = f"⚡ Level 10 V轉極速剝頭皮 (Buy {opt_type})"
+                            elif abs_sig == 3:
+                                tp_mult, sl_mult = 7.5, 4.5
                                 strategy_label = f"🚀 Level 3 極強勢波段 (Buy {opt_type})"
                             elif abs_sig == 2:
-                                tp_mult, sl_mult = 3.0, 1.0
+                                tp_mult, sl_mult = 5.5, 3.0
                                 strategy_label = f"📈 Level 2 標準波段 (Buy {opt_type})"
                             else:
-                                tp_mult, sl_mult = 1.5, 0.5
+                                tp_mult, sl_mult = 3.5, 2.0
                                 strategy_label = f"⚡ Level 1 短線游擊 (Buy {opt_type})"
 
                             current_atr = df_intraday['atr'].iloc[-1]
@@ -509,6 +730,9 @@ def run_live_simulator():
                             days_to_expiry = get_api_based_dte(active_contract, now) / 365.0
                             current_iv = 0.22
 
+                            # 將手續費換算成點數 (每口 100 元，大台選擇權 1 點 50 元)
+                            fee_points = FEE_SLIPPAGE_PER_CONTRACT / float(CONTRACT_MULTIPLIER)
+
                             hard_tp_price, hard_sl_price, d, g, t_decay = get_dynamic_bsm_bounds(
                                 S=current_txf_price,
                                 K=strike_p,
@@ -520,8 +744,14 @@ def run_live_simulator():
                                 sl_mult=sl_mult,
                                 expected_hold_hours=expected_hold_time,
                                 option_type=opt_type,
-                                actual_entry_price=entry_price
+                                actual_entry_price=entry_price,
+                                fee_points=fee_points
                             )
+
+                            expected_profit_points = hard_tp_price - entry_price
+                            if expected_profit_points < 3.0:
+                                print(f"[{time_str}] ⚠️ 預期權利金獲利空間太小 ({expected_profit_points:.1f} 點 < 3.0 點)，放棄進場！")
+                                continue
 
                             num_contracts = max(1, int(allocated_capital_limit // (entry_price * CONTRACT_MULTIPLIER))) if entry_price > 0 else 1
                             trade_capital_used = num_contracts * entry_price * CONTRACT_MULTIPLIER
@@ -538,52 +768,75 @@ def run_live_simulator():
                                 hard_sl_price=hard_sl_price,
                                 strategy_label=strategy_label
                             )
+                            current_active_code = active_contract.code
                             entry_features = {f"feat_{k}": v for k, v in df.iloc[-1].to_dict().items()}
 
                             try:
                                 engine.api.quote.subscribe(active_contract, quote_type=sj.constant.QuoteType.Tick)
+                                engine.api.quote.subscribe(active_contract, quote_type=sj.constant.QuoteType.BidAsk)
                             except:
                                 pass
 
-                            print(f"\n{'='*40}\n🔥 【盤中進場】: {strategy_label}\n當前本金: NT$ {current_capital:,.0f} | 合約: {active_contract.symbol}\n進場價: {entry_price:.2f} | {num_contracts} 口")
+                            delivery_date_str = getattr(active_contract, 'delivery_date', 'N/A')
+                            print(f"\n{'='*40}\n🔥 【盤中進場】: {strategy_label}\n當前本金: NT$ {current_capital:,.0f} | 合約: {active_contract.symbol} (交割日: {delivery_date_str})\n進場價: {entry_price:.2f} | {num_contracts} 口")
                             print(f"📊 [BSM風控對齊] Delta: {d:.3f} | Gamma: {g:.5f} | Theta 損耗: {t_decay:.2f} 點")
                             print(f"🎯 動態停利點: {hard_tp_price} | 動態停損點: {hard_sl_price}\n{'='*40}\n")
 
             elif event_type == 'OPT_TICK':
                 _, symbol, tick_time, price, bid, ask = event
-                opt_quotes[symbol] = {'price': price, 'bid': bid, 'ask': ask}
+
+                if symbol not in opt_quotes:
+                    opt_quotes[symbol] = {'price': 0.0, 'bid': 0.0, 'ask': 0.0}
+
+                if price > 0:
+                    opt_quotes[symbol]['price'] = price
+                if bid > 0:
+                    opt_quotes[symbol]['bid'] = bid
+                if ask > 0:
+                    opt_quotes[symbol]['ask'] = ask
 
                 position = pos_manager.get('position')
-                if position != 0 and pos_manager.get('active_contract_symbol') == symbol:
+                if position != 0 and current_active_code == symbol:
                     # 離場成本修正：出場平倉 (賣出) 時應對齊 Best Bid (買價)
-                    # 這裡的 price 是 Tick 的成交價，我們需要從 opt_quotes 取得最新的買價
-                    best_bid = bid # 來自 OPT_TICK 事件
+                    best_bid = opt_quotes[symbol]['bid']
+                    last_price = opt_quotes[symbol]['price']
+
                     if best_bid <= 0:
-                        # 若無委買價，暫時無法成交出場（除非尾盤強制）
-                        if not is_eod_closing_time(current_time):
-                            return
-                        else:
-                            best_bid = price # 尾盤強制平倉若無買單則用最後成交價
+                        # 若無委買價，退而求其次使用最新成交價 (price) 來進行出場判斷，避免永遠卡單無法平倉
+                        best_bid = last_price
 
                     exec_price = best_bid
                     entry_price = pos_manager.get('entry_price')
                     hard_tp_price = pos_manager.get('hard_tp_price')
                     hard_sl_price = pos_manager.get('hard_sl_price')
-                    highest_price = max(pos_manager.get('highest_price_since_entry'), price)
+
+                    # 修正「最高價幻覺」：使用實際可出場的 best_bid 來更新最高價，而非被瞬間拉高卻無法成交的 last_price (外盤價)
+                    highest_price = max(pos_manager.get('highest_price_since_entry'), best_bid)
 
                     # 計算動態高點回檔停利 (Trailing Stop)
-                    # 邏輯：如果最高獲利超過 15 點，則從最高點回檔 30% 或是固定回檔 10 點就停利出場，確保獲利落袋
+                    # 邏輯：如果最高獲利超過 15 點，則從最高點回檔 22% 或是固定回檔 13 點就停利出場，確保獲利落袋
                     profit_points = highest_price - entry_price
                     trailing_sl = hard_sl_price
+                    # 只要帳面獲利超過 8 點，就啟動追蹤與保本機制
                     if profit_points >= 15:
-                        pullback = max(10, profit_points * 0.3)
+                        if profit_points >= 35:
+                            # 獲利超過 35 點後：容許較大回檔 (例如 13 點 或 獲利的 27%)
+                            pullback = max(13, profit_points * 0.27)
+                        else:
+                            # 獲利 15~34.9 點階段：容許小回檔 (例如 7 點 或 獲利的 20%)
+                            pullback = max(8, profit_points * 0.20)
+
+                        # 動態上移防守線
                         trailing_sl = max(hard_sl_price, highest_price - pullback)
+
+                        # 強制保本鎖：一旦獲利超過 15 點，防守線「絕對不能」低於進場價 + 4.0 點 (手續費滑價)
+                        trailing_sl = max(trailing_sl, entry_price + 4.0)
 
                     if highest_price > pos_manager.get('highest_price_since_entry'):
                         pos_manager.update(highest_price_since_entry=highest_price)
 
                     exit_reason = None
-                    if is_eod_closing_time(current_time):
+                    if is_eod_closing_time(now, is_settlement=is_today_settlement):
                         exit_reason = "尾盤強制平倉 (EOD)"
                     elif exec_price <= trailing_sl and trailing_sl > hard_sl_price:
                         exit_reason = f"觸及高點回檔動態停利 ({trailing_sl:.1f})"
@@ -593,20 +846,35 @@ def run_live_simulator():
                         exit_reason = f"觸及動態停利 ({hard_tp_price})"
 
                     if exit_reason:
+                        last_trade_closed_time = now
+                        last_trade_symbol = current_active_code
+
                         num_contracts = pos_manager.get('num_contracts')
                         trade_capital_used = pos_manager.get('trade_capital_used')
                         points_gained = exec_price - entry_price
                         current_pnl = (points_gained * CONTRACT_MULTIPLIER * num_contracts) - (num_contracts * FEE_SLIPPAGE_PER_CONTRACT)
                         current_ret = current_pnl / trade_capital_used if trade_capital_used > 0 else 0
 
+                        last_trade_pnl = current_pnl
                         current_capital += current_pnl
                         last_trade_win = current_pnl > 0
+                        trade_direction = 'Call' if position == 1 else 'Put'
+
+                        if current_pnl < 0:
+                            consecutive_failures[trade_direction] += 1
+                            consecutive_total_losses += 1
+                            if consecutive_total_losses >= 4:
+                                cooldown_until = now + timedelta(minutes=15)
+                                print(f"\n{'='*40}\n❄️ 【系統冷卻】連續 4 次虧損，暫停交易 15 分鐘！預計於 {cooldown_until.strftime('%H:%M:%S')} 恢復。\n{'='*40}\n")
+                        else:
+                            consecutive_failures[trade_direction] = 0
+                            consecutive_total_losses = 0
 
                         trade_record = {
                             'entry_time': pos_manager.get('entry_time'),
                             'exit_time': now.strftime("%H:%M:%S"),
                             'symbol': symbol,
-                            'direction': 'Call' if position==1 else 'Put',
+                            'direction': trade_direction,
                             'entry_price': entry_price,
                             'exit_price': exec_price,
                             'pnl': current_pnl,
@@ -620,6 +888,7 @@ def run_live_simulator():
 
                         print(f"\n{'='*40}\n🔔 【平倉】: {exit_reason}\n實際盈虧: NT$ {current_pnl:,.0f} ({current_ret * 100:.2f}%)\n最新資金: NT$ {current_capital:,.0f}\n{'='*40}\n")
                         pos_manager.clear_position()
+                        current_active_code = None
                         entry_features = {}
 
         except queue.Empty:
@@ -628,8 +897,10 @@ def run_live_simulator():
                 if (now - last_print_time).total_seconds() >= 10:
                     last_print_time = now
                     sym = pos_manager.get('active_contract_symbol')
-                    if sym in opt_quotes:
-                        price = opt_quotes[sym]['price']
+                    quote_data = opt_quotes.get(current_active_code, {}) if current_active_code else {}
+                    price = quote_data.get('price', 0)
+
+                    if price > 0:
                         entry_price = pos_manager.get('entry_price')
                         num_contracts = pos_manager.get('num_contracts')
                         hard_sl = pos_manager.get('hard_sl_price')
@@ -644,6 +915,10 @@ def run_live_simulator():
                         points_gained = price - entry_price
                         current_pnl = (points_gained * CONTRACT_MULTIPLIER * num_contracts) - (num_contracts * FEE_SLIPPAGE_PER_CONTRACT)
                         print(f"[{time_str}] 持倉: {sym} | 買入價: {entry_price} | 現價: {price} | 最高: {highest} | 防守價(SL/TSL): {trailing_sl:.1f} | 停利: {pos_manager.get('hard_tp_price')} | 帳面損益: {current_pnl:,.0f}")
+            else:
+                if (now - heartbeat_time).total_seconds() >= 60:
+                    heartbeat_time = now
+                    print(f"[{time_str}] ⏳ 系統監控中... 等待交易訊號 (目前台指期現價: {current_txf_price})")
         except Exception as e:
             print(f"[{time_str}] ❌ 主迴圈異常錯誤: {e}")
 

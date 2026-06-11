@@ -37,10 +37,13 @@ class DayTradingDataEngine:
         """
         # 計算動態日期區間 (確保結束日期為 today)
         today = datetime.now()
-        start_date = (today - timedelta(days=days)).strftime("%Y-%m-%d")
+        target_start_date = (today - timedelta(days=days)).strftime("%Y-%m-%d")
+        
+        # 為了確保均線與昨日收盤價計算準確 (跨週末與長假)，往前多抓 15 天作為緩衝
+        fetch_start_date = (today - timedelta(days=days + 15)).strftime("%Y-%m-%d")
         end_date = today.strftime("%Y-%m-%d")
 
-        print(f"📡 [DATA] 正在抓取數據範圍: {start_date} 至 {end_date}")
+        print(f"📡 [DATA] 正在抓取數據範圍: {fetch_start_date} 至 {end_date} (含緩衝期)")
 
         try:
             # 1. 強制重新整理合約清單，防止合約轉倉導致數據舊化
@@ -52,7 +55,7 @@ class DayTradingDataEngine:
                 return pd.DataFrame()
 
             # 2. 下載 K 線
-            kbars = self.api.kbars(contract, start=start_date, end=end_date)
+            kbars = self.api.kbars(contract, start=fetch_start_date, end=end_date)
             df = pd.DataFrame({**kbars})
 
             if df.empty:
@@ -105,6 +108,57 @@ class DayTradingDataEngine:
             rs = gain / (loss + 1e-9)
             df['rsi'] = 100 - (100 / (1 + rs))
 
+            # 微觀反轉特徵 (Micro-reversal)
+            # Fast RSI (e.g., period=3)
+            gain_fast = (delta.where(delta > 0, 0)).rolling(window=3).mean()
+            loss_fast = (-delta.where(delta < 0, 0)).rolling(window=3).mean()
+            rs_fast = gain_fast / (loss_fast + 1e-9)
+            df['rsi_fast'] = 100 - (100 / (1 + rs_fast))
+            
+            # K線實體與影線解析
+            df['body_length'] = abs(df['Close'] - df['Open'])
+            df['upper_shadow'] = df['High'] - df[['Open', 'Close']].max(axis=1)
+            df['lower_shadow'] = df[['Open', 'Close']].min(axis=1) - df['Low']
+            
+            # 動能爆發 (當前K線實體長度是否大於過去5根平均)
+            df['body_avg_5'] = df['body_length'].rolling(5).mean()
+            df['momentum_explosion'] = (df['body_length'] > df['body_avg_5']).astype(int)
+
+            # 日級別格局 (Daily Context) 與 大盤現貨相對強弱
+            # 每日開盤價
+            df['daily_open'] = df.groupby('date_only')['Open'].transform('first')
+            
+            # 昨日收盤價 (先算出每天最後一筆，再平移，再 map 回去)
+            daily_close = df.groupby('date_only')['Close'].last().shift(1)
+            df['yesterday_close'] = df['date_only'].map(daily_close)
+            
+            # 若為第一天無昨日收盤價，使用當日開盤價替代 (Gap = 0)
+            df['yesterday_close'] = df['yesterday_close'].fillna(df['daily_open'])
+            
+            # 跳空缺口幅度
+            df['gap_amplitude'] = (df['daily_open'] - df['yesterday_close']) / (df['yesterday_close'] + 1e-9)
+            
+            # 日內絕對趨勢 (當前價格相對於當日開盤的漲跌幅，衡量真實K線實體)
+            df['intraday_trend'] = (df['Close'] - df['daily_open']) / (df['daily_open'] + 1e-9)
+            
+            # 均值回歸與突破輔助特徵 (Mean Reversion / Breakout Aux)
+            # 1. 乖離均線 (Distance from MA) - 判斷拉回深度
+            df['dist_from_ma20'] = (df['Close'] - df['Close'].rolling(20).mean()) / (df['Close'].rolling(20).mean() + 1e-9)
+            
+            # 2. 區間高低點回撤 (Pullback Depth) - 判斷目前是創高還是拉回
+            df['recent_high_20'] = df['High'].rolling(20).max()
+            df['recent_low_20'] = df['Low'].rolling(20).min()
+            df['pullback_from_high'] = (df['Close'] - df['recent_high_20']) / (df['recent_high_20'] + 1e-9)
+            df['bounce_from_low'] = (df['Close'] - df['recent_low_20']) / (df['recent_low_20'] + 1e-9)
+            
+            # 缺口回補狀態 (1: 已回補, 0: 未回補)
+            df['gap_filled'] = 0
+            df.loc[(df['gap_amplitude'] > 0) & (df['Close'] <= df['yesterday_close']), 'gap_filled'] = 1
+            df.loc[(df['gap_amplitude'] < 0) & (df['Close'] >= df['yesterday_close']), 'gap_filled'] = 1
+            
+            # 簡單期現貨基差趨勢代理 (如果沒有現貨，用 VWAP 與 MA 的相對強弱代替)
+            df['spot_futures_proxy'] = (df['Close'] - df['vwap']) / (df['Close'].rolling(20).mean() + 1e-9)
+
             # Bollinger Bands
             df['sma20'] = df['Close'].rolling(window=20).mean()
             df['std20'] = df['Close'].rolling(window=20).std()
@@ -147,23 +201,48 @@ class DayTradingDataEngine:
             return pd.DataFrame()
 
     def get_best_volume_option_contract(self, option_type='Call', allocated_capital=100000):
-        """🚀 依據成交量與資金篩選近月合約"""
+        """🚀 依據最短到期日與最大成交量及資金篩選合約 (優先選週選)"""
         try:
             txf_contract = self.api.Contracts.Futures.TXF.TXFR1
             snap = self.api.snapshots([txf_contract])[0]
             current_index = snap.close
 
             all_options = []
-            for cat in ['TXO', 'TX1', 'TX2', 'TX4', 'TX5']:
+            for cat in ['TXO', 'TX1', 'TX2', 'TX4', 'TX5', 'TXU', 'TXV', 'TXX']:
                 if hasattr(self.api.Contracts.Options, cat):
                     all_options.extend([c for c in getattr(self.api.Contracts.Options, cat)])
 
-            delivery_months = sorted(list(set(c.delivery_month for c in all_options)))
-            if not delivery_months: return None
+            if not all_options: return None
 
-            near_month = delivery_months[0]
-            
-            near_contracts = [c for c in all_options if c.delivery_month == near_month and c.option_right.name == option_type]
+            # 抓取今天日期以計算真實剩餘天數 (使用 Shioaji API 格式通常是 YYYYMM 或 YYYYMM(W))
+            # 這裡我們利用 get_api_based_dte 或是簡單依賴合約的 delivery_month 字串長度/排序
+            # 但更精確的做法是計算到期日。由於這裡沒有 DTE 函數，我們透過字串排序來優先選週選。
+            # 通常 weekly 是 202606W1, 202606W2, 或是 TX1, TX2, TX4, TX5
+            # Shioaji 裡面的 delivery_month 格式例如 "202606" 或 "202606W1" (有些是 202606F1)
+            # 為了確保抓到最近的，我們先過濾掉過期的，再以 "最近" 為主
+
+            # Shioaji 的期權合約物件通常有 delivery_date 屬性，格式如 '2026/06/03'
+            # 我們直接使用 delivery_date 排序找出最近到期的合約群
+            valid_contracts_with_date = []
+            today_str = datetime.now().strftime('%Y/%m/%d')
+
+            for c in all_options:
+                if c.option_right.name == option_type:
+                    delivery_date = getattr(c, 'delivery_date', None)
+                    if delivery_date and delivery_date >= today_str:
+                        valid_contracts_with_date.append(c)
+
+            if not valid_contracts_with_date:
+                return self.api.Contracts.Futures.TXF.TXFR1
+
+            # 依據 delivery_date 排序，找出最近的到期日
+            valid_contracts_with_date.sort(key=lambda x: x.delivery_date)
+            nearest_date = valid_contracts_with_date[0].delivery_date
+
+            # 取出所有這個最近到期日的合約 (可能是週選或剛好是月選結算日)
+            near_contracts = [c for c in valid_contracts_with_date if c.delivery_date == nearest_date]
+
+            # 依照履約價與目前指數的距離排序
             near_contracts.sort(key=lambda x: abs(x.strike_price - current_index))
             target_contracts = near_contracts[:30] # 擴大範圍至上下15檔
 
@@ -171,23 +250,25 @@ class DayTradingDataEngine:
                 return self.api.Contracts.Futures.TXF.TXFR1
 
             snaps = self.api.snapshots(target_contracts)
-            
+
             valid_contracts = []
             for i, snap in enumerate(snaps):
-                price = snap.close
-                volume = snap.total_volume
-                # 篩選條件：有報價且買得起 (選擇權一點 50 元)
-                if price > 0 and (price * 50) <= allocated_capital:
+                price = getattr(snap, 'close', 0)
+                if price == 0 and hasattr(snap, 'buy_price'): price = getattr(snap, 'buy_price', 0)
+                volume = getattr(snap, 'total_volume', 0)
+                # 篩選條件：權利金必須 >= 5 點且買得起 (選擇權一點 50 元)
+                if price >= 5 and (price * 50) <= allocated_capital:
                     valid_contracts.append({
                         'contract': target_contracts[i],
                         'price': price,
                         'volume': volume
                     })
-            
+
             if not valid_contracts:
                 target_contracts.sort(key=lambda x: abs(x.strike_price - current_index), reverse=True)
                 return target_contracts[0]
-                
+
+            # 在這些最近到期的合約中，依據成交量排序取最大者
             valid_contracts.sort(key=lambda x: x['volume'], reverse=True)
             return valid_contracts[0]['contract']
 
@@ -195,9 +276,11 @@ class DayTradingDataEngine:
             print(f"❌ 成交量合約定位失敗: {e}")
             return self.api.Contracts.Futures.TXF.TXFR1
 
-    def fetch_real_historical_chips(self, days=90):
+    def fetch_real_historical_chips(self, days=180):
         """
         🚀 自動向期交所與證交所抓取真實歷史籌碼 (完整健壯版)
+        - 針對現貨買賣超：整合 FinMind API 快速獲取 180 天資料，避開迴圈延遲
+        - 針對期交所：增加容錯，若遇假日無資料則略過
         """
         import io
         import requests
@@ -226,7 +309,7 @@ class DayTradingDataEngine:
             'Referer': 'https://www.taifex.com.tw/cht/3/futContractsDate'
         }
 
-        # 1. 自動分段邏輯 (防止 API 下載區間限制)
+        # 1. 自動分段邏輯 (防止 API 下載區間限制，期交所一次最多可抓 30 天)
         date_chunks = []
         curr = start_date
         while curr < end_date:
@@ -255,7 +338,12 @@ class DayTradingDataEngine:
                     # 修正期交所 CSV 結尾逗號導致的欄位平移問題
                     lines = [line.strip().rstrip(',') for line in content_str.split('\n') if line.strip()]
                     content_str = '\n'.join(lines)
-                    pc_frames.append(pd.read_csv(io.StringIO(content_str), index_col=False))
+                    try:
+                        df_chunk = pd.read_csv(io.StringIO(content_str), index_col=False)
+                        if not df_chunk.empty and len(df_chunk.columns) > 2:
+                            pc_frames.append(df_chunk)
+                    except Exception as parse_e:
+                        pass # Ignore chunk errors (e.g. weekends)
 
                 time.sleep(1) # 增加延遲避免被封鎖
 
@@ -268,85 +356,116 @@ class DayTradingDataEngine:
                     # 修正期交所 CSV 結尾逗號導致的欄位平移問題
                     lines = [line.strip().rstrip(',') for line in content_str.split('\n') if line.strip()]
                     content_str = '\n'.join(lines)
-                    oi_frames.append(pd.read_csv(io.StringIO(content_str), index_col=False))
+                    try:
+                        df_chunk = pd.read_csv(io.StringIO(content_str), index_col=False)
+                        if not df_chunk.empty and len(df_chunk.columns) > 2:
+                            oi_frames.append(df_chunk)
+                    except Exception as parse_e:
+                        pass # Ignore chunk errors
 
                 time.sleep(1) # 增加延遲避免被封鎖
             except Exception as e:
-                print(f"⚠️ 下載警告: {e}")
+                print(f"⚠️ 區段下載警告: {e}")
 
-        if not pc_frames or not oi_frames:
-            print("❌ 籌碼抓取失敗，API 回傳無資料")
-            return pd.DataFrame()
+        df_pc, df_foreign, df_dealer = pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
         # 3. 清理 P/C Ratio
-        df_pc = pd.concat(pc_frames, ignore_index=True)
-        df_pc.columns = df_pc.columns.str.strip()
-        date_col = [c for c in df_pc.columns if '日期' in c][0]
-        pc_col = [c for c in df_pc.columns if '比率' in c or '買賣權未平倉' in c][0]
-        df_pc = df_pc[[date_col, pc_col]].copy()
-        df_pc.rename(columns={date_col: 'date', pc_col: 'pc_ratio'}, inplace=True)
-        df_pc['date'] = pd.to_datetime(df_pc['date'].astype(str).str.strip(), format='mixed', errors='coerce').dt.date
-        df_pc['pc_ratio'] = pd.to_numeric(df_pc['pc_ratio'].astype(str).str.replace(',', ''), errors='coerce') / 100.0
+        if pc_frames:
+            df_pc = pd.concat(pc_frames, ignore_index=True)
+            df_pc.columns = df_pc.columns.str.strip()
+            date_col = [c for c in df_pc.columns if '日期' in c]
+            pc_col = [c for c in df_pc.columns if '比率' in c or '買賣權未平倉' in c]
+            
+            if date_col and pc_col:
+                df_pc = df_pc[[date_col[0], pc_col[0]]].copy()
+                df_pc.rename(columns={date_col[0]: 'date', pc_col[0]: 'pc_ratio'}, inplace=True)
+                df_pc['date'] = pd.to_datetime(df_pc['date'].astype(str).str.strip(), format='mixed', errors='coerce').dt.date
+                df_pc['pc_ratio'] = pd.to_numeric(df_pc['pc_ratio'].astype(str).str.replace(',', ''), errors='coerce') / 100.0
 
         # 4. 清理期貨 OI
-        df_oi = pd.concat(oi_frames, ignore_index=True)
-        df_oi.columns = df_oi.columns.str.strip()
+        if oi_frames:
+            df_oi = pd.concat(oi_frames, ignore_index=True)
+            df_oi.columns = df_oi.columns.str.strip()
 
-        # 檢查是否被阻擋而回傳 HTML
-        if any('DOCTYPE' in str(c) or 'html' in str(c).lower() for c in df_oi.columns):
-            print("❌ API 回傳 HTML 錯誤頁面，可能遭到阻擋或網址失效。")
-            return pd.DataFrame()
+            # 兼容不同欄位名稱：商品名稱 或 契約名稱
+            item_col = '商品名稱' if '商品名稱' in df_oi.columns else '契約名稱'
+            if item_col not in df_oi.columns:
+                item_cols = [c for c in df_oi.columns if '名稱' in c]
+                if item_cols: item_col = item_cols[0]
 
-        # 兼容不同欄位名稱：商品名稱 或 契約名稱
-        item_col = '商品名稱' if '商品名稱' in df_oi.columns else '契約名稱'
-        if item_col not in df_oi.columns:
-            # 如果還是沒有，嘗試找包含「名稱」的欄位
-            item_cols = [c for c in df_oi.columns if '名稱' in c]
-            if item_cols:
-                item_col = item_cols[0]
-            else:
-                print("❌ 找不到商品/契約名稱欄位！")
-                return pd.DataFrame()
+            if item_col in df_oi.columns:
+                df_oi = df_oi[df_oi[item_col].astype(str).str.strip() == '臺股期貨']
+                net_col = [c for c in df_oi.columns if '未平倉' in c and '口數' in c]
+                if net_col:
+                    net_col = net_col[0]
+                    df_foreign = df_oi[df_oi['身份別'].astype(str).str.strip() == '外資及陸資'][['日期', net_col]].rename(columns={'日期': 'date', net_col: 'foreign_net_oi'})
+                    df_dealer = df_oi[df_oi['身份別'].astype(str).str.strip() == '自營商'][['日期', net_col]].rename(columns={'日期': 'date', net_col: 'dealer_net_oi'})
 
-        df_oi = df_oi[df_oi[item_col].astype(str).str.strip() == '臺股期貨']
-        net_col = [c for c in df_oi.columns if '未平倉' in c and '口數' in c][0]
+                    for df_tmp in [df_foreign, df_dealer]:
+                        if not df_tmp.empty:
+                            df_tmp['date'] = pd.to_datetime(df_tmp['date'].astype(str).str.strip(), format='mixed', errors='coerce')
+                            df_tmp.dropna(subset=['date'], inplace=True)
+                            df_tmp.iloc[:, 1] = pd.to_numeric(df_tmp.iloc[:, 1].astype(str).str.replace(',', ''), errors='coerce')
 
-        df_foreign = df_oi[df_oi['身份別'].astype(str).str.strip() == '外資及陸資'][['日期', net_col]].rename(columns={'日期': 'date', net_col: 'foreign_net_oi'})
-        df_dealer = df_oi[df_oi['身份別'].astype(str).str.strip() == '自營商'][['日期', net_col]].rename(columns={'日期': 'date', net_col: 'dealer_net_oi'})
+        if not df_pc.empty: df_pc['date'] = pd.to_datetime(df_pc['date'])
 
-        for df_tmp in [df_foreign, df_dealer]:
-            df_tmp['date'] = pd.to_datetime(df_tmp['date'].astype(str).str.strip(), format='mixed', errors='coerce')
-            df_tmp.dropna(subset=['date'], inplace=True)
-            df_tmp.iloc[:, 1] = pd.to_numeric(df_tmp.iloc[:, 1].astype(str).str.replace(',', ''), errors='coerce')
-
-        # 確保 df_pc['date'] 也是 datetime64[ns] 型別
-        df_pc['date'] = pd.to_datetime(df_pc['date'])
-
-        # 5. 抓取證交所現貨
+        # 5. 抓取證交所現貨 (FinMind API - 優化效能)
         twse_data = []
-        for dt in pd.date_range(start=start_date, end=end_date):
-            if dt.weekday() >= 5: continue
-            try:
-                # 若有平移年份，則請求真實歷史資料
-                query_dt = dt.replace(year=dt.year - year_offset)
-                res = session.get(f"https://www.twse.com.tw/exchangeReport/BFI82U?response=json&dayDate={query_dt.strftime('%Y%m%d')}&type=day", headers=headers, timeout=5)
-                data = res.json()
-                if data.get('stat') == 'OK':
-                    f_s, d_s = 0.0, 0.0
-                    for row in data['data']:
-                        if '外資及陸資' in row[0]: f_s += float(row[3].replace(',', ''))
-                        elif '自營商' in row[0]: d_s += float(row[3].replace(',', ''))
-                    twse_data.append({'date': pd.to_datetime(dt.date()), 'foreign_spot_net': f_s, 'dealer_spot_net': d_s})
-                time.sleep(1)
-            except: pass
-        df_twse = pd.DataFrame(twse_data) if twse_data else pd.DataFrame(columns=['date', 'foreign_spot_net', 'dealer_spot_net'])
+        token = os.environ.get('FINMIND_API_TOKEN', 'eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ1c2VyX2lkIjoibG9zdG1lbG9keSIsImVtYWlsIjoibGVhdmU5MThAZ21haWwuY29tIiwidG9rZW5fdmVyc2lvbiI6MH0.BmG_w18TAEobmpkAA3BO_9mPvWiVrXwYfey_n7xRUQ4')
+        try:
+            print("🚀 使用 FinMind API 一次性抓取現貨買賣超...")
+            url = 'https://api.finmindtrade.com/api/v4/data'
+            
+            # 若有平移年份，則請求真實歷史資料
+            query_start = start_date.replace(year=start_date.year - year_offset).strftime("%Y-%m-%d")
+            query_end = end_date.replace(year=end_date.year - year_offset).strftime("%Y-%m-%d")
+            
+            params = {
+                'dataset': 'TaiwanStockTotalInstitutionalInvestors',
+                'start_date': query_start,
+                'end_date': query_end,
+                'token': token
+            }
+            res = session.get(url, params=params, timeout=15)
+            data = res.json().get('data', [])
+            
+            if data:
+                df_fm = pd.DataFrame(data)
+                for dt, grp in df_fm.groupby('date'):
+                    f_s = grp[grp['name'].str.contains('Foreign_Investor')]['buy'].sum() - grp[grp['name'].str.contains('Foreign_Investor')]['sell'].sum()
+                    d_s = grp[grp['name'].str.contains('Dealer')]['buy'].sum() - grp[grp['name'].str.contains('Dealer')]['sell'].sum()
+                    
+                    # 映射回未來時間
+                    dt_obj = pd.to_datetime(dt)
+                    if year_offset > 0: 
+                        try:
+                            dt_obj = dt_obj.replace(year=dt_obj.year + year_offset)
+                        except ValueError:
+                            # 處理 2 月 29 日平移到非閏年的問題
+                            dt_obj = dt_obj.replace(year=dt_obj.year + year_offset, day=28)
+                        
+                    twse_data.append({'date': dt_obj, 'foreign_spot_net': f_s, 'dealer_spot_net': d_s})
+        except Exception as e:
+            print(f"⚠️ FinMind 現貨資料抓取失敗: {e}")
 
-        if not df_twse.empty:
-            df_twse['date'] = pd.to_datetime(df_twse['date'])
+        df_twse = pd.DataFrame(twse_data) if twse_data else pd.DataFrame(columns=['date', 'foreign_spot_net', 'dealer_spot_net'])
+        if not df_twse.empty: df_twse['date'] = pd.to_datetime(df_twse['date'])
 
         # 6. 合併與最終清理
-        df_final = df_pc.merge(df_foreign, on='date', how='outer').merge(df_dealer, on='date', how='outer')
-        if not df_twse.empty: df_final = df_final.merge(df_twse, on='date', how='outer')
+        if df_pc.empty and df_foreign.empty and df_twse.empty:
+            print("❌ 籌碼抓取全部失敗")
+            return pd.DataFrame()
+
+        df_final = pd.DataFrame()
+        if not df_pc.empty: df_final = df_pc
+        if not df_foreign.empty:
+            df_final = df_final.merge(df_foreign, on='date', how='outer') if not df_final.empty else df_foreign
+        if not df_dealer.empty:
+            df_final = df_final.merge(df_dealer, on='date', how='outer') if not df_final.empty else df_dealer
+        if not df_twse.empty: 
+            df_final = df_final.merge(df_twse, on='date', how='outer') if not df_final.empty else df_twse
+
+        if df_final.empty: return pd.DataFrame()
 
         df_final.sort_values('date', inplace=True)
 
@@ -375,6 +494,14 @@ class DayTradingDataEngine:
             if col in df_chips.columns:
                 df_chips[f'{col}_zscore'] = (df_chips[col] - df_chips[col].rolling(20).mean()) / (df_chips[col].rolling(20).std() + 1e-9)
                 df_chips[f'{col}_momentum'] = df_chips[col].diff()
+                
+        # --- 強化自營商籌碼特徵 (Dealer Enhancements) ---
+        if 'dealer_net_oi_momentum' in df_chips.columns and 'foreign_net_oi_momentum' in df_chips.columns:
+            # 衡量自營商相對於外資的動能強弱 (自營商動能 - 外資動能)
+            df_chips['dealer_relative_momentum'] = df_chips['dealer_net_oi_momentum'] - df_chips['foreign_net_oi_momentum']
+            
+            # 自營商極端動能分數 (如果今天大買大賣)
+            df_chips['dealer_extreme_score'] = (df_chips['dealer_net_oi_momentum'] / (df_chips['dealer_net_oi_momentum'].abs().rolling(10).mean() + 1e-9)).clip(-3, 3)
 
         # 3. 未來函數防禦：將籌碼指標 Shift(1) (僅在非單日快照模式下執行)
         if len(df_chips) > 1:
@@ -384,7 +511,7 @@ class DayTradingDataEngine:
             print("ℹ️ [DataEngine] 偵測到單日籌碼快照，跳過 Shift(1) 以保留當前資訊。")
 
         # 4. 合併數據 (使用 merge_asof 確保即使日期有落差也能抓到最新的一筆籌碼)
-        df_intraday = df_intraday.sort_values('date_only')
+        df_intraday = df_intraday.sort_values('date')
         df_chips = df_chips.sort_values('date').dropna(subset=['date'])
         
         # 移除含有 NaT 的 date_only 以避免 merge_asof 報錯
@@ -398,10 +525,13 @@ class DayTradingDataEngine:
             df_chips, 
             left_on='date_only_dt', 
             right_on='date_dt', 
-            direction='backward'
+            direction='backward',
+            suffixes=('', '_y')
         )
         
-        df_merged.drop(columns=['date_only_dt', 'date_dt'], inplace=True, errors='ignore')
+        # 移除重複的 _y 欄位，並將 date 恢復正常
+        cols_to_drop = ['date_only_dt', 'date_dt'] + [c for c in df_merged.columns if c.endswith('_y')]
+        df_merged.drop(columns=cols_to_drop, inplace=True, errors='ignore')
 
         # 5. 分層填補策略 (Layered Imputation Strategy)
         # 定義哪些指標是「水準值」，哪些是「變動量」
