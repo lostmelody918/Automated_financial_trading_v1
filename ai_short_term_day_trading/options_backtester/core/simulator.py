@@ -115,9 +115,19 @@ class OptionsSimulator:
         except Exception as e:
             print(f"Failed to query distinct symbols: {e}")
             
+        # Fallback: dynamically estimate ATM contracts based on intraday features
+        base_strike = 15000
+        if hasattr(self, 'df_intraday') and not self.df_intraday.empty:
+            open_price = self.df_intraday.iloc[0]['Close']
+            # Round to nearest 100
+            base_strike = int(round(open_price / 100.0) * 100)
+            
+        c_strikes = [base_strike, base_strike + 100, base_strike + 200]
+        p_strikes = [base_strike, base_strike - 100, base_strike - 200]
+            
         return {
-            'calls': ['TXO15000C', 'TXO15100C', 'TXO15200C'],
-            'puts': ['TXO14800P', 'TXO14900P', 'TXO15000P']
+            'calls': [f'TXO{s}C' for s in c_strikes],
+            'puts': [f'TXO{s}P' for s in p_strikes]
         }
 
     def load_ticks_to_engine(self, symbols: list):
