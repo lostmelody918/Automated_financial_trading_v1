@@ -185,7 +185,7 @@ class OptionsSimulator:
     def run_simulation(self):
         if not self.engine or self.df_intraday.empty:
             print("Cannot run simulation. Missing C++ engine or intraday features.")
-            return []
+            return [], pd.DataFrame(), {}, pd.DataFrame()
             
         top_contracts = self.find_top_volume_contracts()
         all_symbols = top_contracts['calls'] + top_contracts['puts']
