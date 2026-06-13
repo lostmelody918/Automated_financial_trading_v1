@@ -3,28 +3,44 @@ import numpy as np
 from datetime import datetime, timedelta
 import os
 import sys
+import json
+import torch
+import traceback
 from dotenv import load_dotenv
 
 # Append paths
-base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+core_dir = os.path.dirname(os.path.abspath(__file__))
+base_dir = os.path.dirname(core_dir) # options_backtester
+ai_dir = os.path.dirname(base_dir) # ai_short_term_day_trading
+project_root = os.path.dirname(ai_dir)
+
 sys.path.append(base_dir)
+sys.path.append(ai_dir)
 
 # Load .env variables
-project_root = os.path.dirname(os.path.dirname(base_dir))
 load_dotenv(os.path.join(project_root, '.env'))
 
 from database.timescale_client import TimescaleDBClient
 
-# Note: In a real environment, you must build the cpp_engine first to import options_replay
+# Import AI modules
 try:
-    # Add the build directory to sys.path so Python can find the .pyd file
+    from data_engine import DayTradingDataEngine
+    from composite_ai import CompositeDayTradingAI
+    from model_manager import TradingModelManager
+    from strategy_factory import StrategyFactory
+    from delta_gamma_theta import get_dynamic_bsm_bounds, calculate_bs_greeks
+except ImportError as e:
+    print(f"Error importing AI modules: {e}")
+    traceback.print_exc()
+
+# Import C++ or Fallback Engine
+try:
     build_dir = os.path.join(base_dir, 'cpp_engine', 'build')
     sys.path.append(build_dir)
     import options_replay
     print("✅ Successfully loaded high-performance C++ Order Book Replay Engine.")
 except ImportError:
     print("⚠️ Warning: options_replay C++ module not found. Falling back to Python mock engine.")
-    # Assuming options_replay_fallback.py is in the core directory
     import options_replay_fallback as options_replay
 
 class OptionsSimulator:
@@ -37,17 +53,48 @@ class OptionsSimulator:
         self.db = TimescaleDBClient(db_url)
         self.engine = options_replay.SimulationEngine() if options_replay else None
         
+        self._init_ai()
+        
+    def _init_ai(self):
+        print("🤖 Initializing AI Model and Strategy Factory...")
+        # Load Norm Params
+        norm_path = os.path.join(ai_dir, "saved_models", "norm_params.json")
+        if os.path.exists(norm_path):
+            with open(norm_path, 'r', encoding='utf-8') as f:
+                self.norm_params = json.load(f)
+        else:
+            print("❌ norm_params.json not found!")
+            self.norm_params = None
+
+        if self.norm_params:
+            self.feature_cols = [c for c in self.norm_params['feature_cols'] if c in self.norm_params['mean']]
+            self.mean_v = np.array([self.norm_params['mean'][c] for c in self.feature_cols])
+            self.std_v = np.array([self.norm_params['std'][c] for c in self.feature_cols])
+        
+            self.ai_model = CompositeDayTradingAI(input_dim=len(self.feature_cols), d_model=256, nhead=16, num_layers=4)
+            model_manager = TradingModelManager(model_dir=os.path.join(ai_dir, "saved_models"))
+            self.ai_model, _, _ = model_manager.load_latest_model(self.ai_model)
+            self.ai_model.eval()
+        
+        self.strategy_engine = StrategyFactory.get_strategy("composite")
+        
+        print("📡 Fetching historical features from Shioaji Data Engine...")
+        data_engine = DayTradingDataEngine()
+        df_all = data_engine.fetch_intraday_data(days=15)
+        
+        # Filter for the target date
+        if not df_all.empty:
+            df_all['date_str'] = df_all['date'].dt.strftime('%Y-%m-%d')
+            self.df_intraday = df_all[df_all['date_str'] == self.target_date].reset_index(drop=True)
+            print(f"📊 Extracted {len(self.df_intraday)} K-bars for {self.target_date}.")
+        else:
+            self.df_intraday = pd.DataFrame()
+            print("⚠️ Data engine returned empty dataframe.")
+
     def find_top_volume_contracts(self) -> dict:
-        """
-        Finds the top 3 volume Call and Put contracts for the nearest expiration
-        on the target date.
-        """
         start_time = f"{self.target_date} 08:45:00"
         end_time = f"{self.target_date} 13:45:00"
         
-        print(f"Querying available contracts for {self.target_date}")
-        
-        # 嘗試從資料庫中找出當天實際有的合約
         try:
             if not self.db.conn:
                 self.db.connect()
@@ -56,11 +103,8 @@ class OptionsSimulator:
             available_symbols = df_symbols['symbol'].tolist()
             
             if available_symbols:
-                # 簡單區分 Call 和 Put
                 calls = [s for s in available_symbols if s.endswith('C') or 'C' in s]
                 puts = [s for s in available_symbols if s.endswith('P') or 'P' in s]
-                
-                # 若無明確區分，則全放
                 if not calls and not puts:
                     calls = available_symbols
                 
@@ -77,37 +121,31 @@ class OptionsSimulator:
         }
 
     def load_ticks_to_engine(self, symbols: list):
-        """
-        Loads ticks from TimescaleDB and feeds them to the C++ engine.
-        """
         start_time = f"{self.target_date} 08:45:00"
         end_time = f"{self.target_date} 13:45:00"
-        
-        print(f"Loading ticks from DB for {symbols}")
         
         try:
             df = self.db.fetch_ticks(start_time, end_time, symbols)
         except Exception as e:
             print(f"Database fetch failed: {e}. Generating mock data for testing.")
-            # Generate mock ticks for testing if DB is unavailable
             times = pd.date_range(start=start_time, end=end_time, freq="1s")
             dfs = []
             for sym in symbols:
+                # 簡單 mock: 選擇權價格 100 左右
                 sym_df = pd.DataFrame({
                     'time': times,
                     'symbol': sym,
-                    'price': np.random.normal(100, 1, len(times)).cumsum() + 150,
+                    'price': np.random.normal(0, 0.1, len(times)).cumsum() + 100,
                     'volume': np.random.randint(1, 5, len(times)),
-                    'bid_price': 149.0,
-                    'bid_volume': 10,
-                    'ask_price': 151.0,
-                    'ask_volume': 10
                 })
+                sym_df['bid_price'] = sym_df['price'] - 1.0
+                sym_df['ask_price'] = sym_df['price'] + 1.0
+                sym_df['bid_volume'] = 10
+                sym_df['ask_volume'] = 10
                 dfs.append(sym_df)
             df = pd.concat(dfs, ignore_index=True)
         
         if df.empty or self.engine is None:
-            print("No data or engine missing.")
             return df
             
         for symbol in symbols:
@@ -123,118 +161,152 @@ class OptionsSimulator:
                 t.ask_price = row['ask_price']
                 t.ask_volume = row['ask_volume']
                 ticks.append(t)
-            
             self.engine.feed_ticks(symbol, ticks)
             
         return df
 
+    def extract_strike_from_symbol(self, symbol: str):
+        import re
+        match = re.search(r'\d+', symbol)
+        if match:
+            return float(match.group())
+        return 15000.0
+
     def run_simulation(self):
-        """
-        Executes the simulation strictly from 08:45 to 13:45.
-        Includes a real backtesting mock strategy: Entry at 09:00, Trailing Stop, Exit at 13:30.
-        """
-        if not self.engine:
-            print("Cannot run simulation without C++ engine.")
-            return
+        if not self.engine or self.df_intraday.empty:
+            print("Cannot run simulation. Missing C++ engine or intraday features.")
+            return []
             
         top_contracts = self.find_top_volume_contracts()
         all_symbols = top_contracts['calls'] + top_contracts['puts']
-        
         if not all_symbols:
             print("No contracts found to simulate.")
-            return
+            return []
             
-        df = self.load_ticks_to_engine(all_symbols)
-        if df.empty:
-            return
-            
-        # Select the primary Call contract for our simple test strategy
-        target_symbol = top_contracts['calls'][0] if top_contracts['calls'] else all_symbols[0]
-            
-        # Replay at 1-second intervals for the day
+        self.load_ticks_to_engine(all_symbols)
+        
         start_ts = int(pd.to_datetime(f"{self.target_date} 08:45:00").timestamp() * 1000)
         end_ts = int(pd.to_datetime(f"{self.target_date} 13:45:00").timestamp() * 1000)
         
-        print(f"\n🚀 Starting Order Book Replay & Strategy Backtest from {start_ts} to {end_ts}")
-        print(f"🎯 Target Contract: {target_symbol}")
+        print(f"\n🚀 Starting Live-Logic Options Backtest from {start_ts} to {end_ts}")
         
         current_ts = start_ts
         
-        # Strategy State Variables
+        # Position State
         position = 0
+        active_symbol = None
         entry_price = 0.0
-        highest_price = 0.0
-        trailing_stop_points = 10.0
+        hard_sl_price = 0.0
+        hard_tp_price = 0.0
         pnl = 0.0
         trade_log = []
+        last_trade_win = False
         
-        # Time markers
-        entry_time_ms = int(pd.to_datetime(f"{self.target_date} 09:00:00").timestamp() * 1000)
-        exit_time_ms = int(pd.to_datetime(f"{self.target_date} 13:30:00").timestamp() * 1000)
+        # Time Management
+        # Pre-process the intraday df so we can quickly lookup features by minute
+        self.df_intraday['time_ms'] = self.df_intraday['date'].apply(lambda x: int(x.timestamp() * 1000))
         
         while current_ts <= end_ts:
             self.engine.advance_to(current_ts)
+            current_dt = pd.to_datetime(current_ts, unit='ms')
             
-            # 1. Entry Logic: Buy at 09:00:00 using Best Ask
-            if current_ts >= entry_time_ms and position == 0 and len(trade_log) == 0:
-                ask_price = self.engine.get_best_ask(target_symbol)
-                if ask_price > 0:
-                    position = 1
-                    entry_price = ask_price
-                    highest_price = ask_price
-                    time_str = pd.to_datetime(current_ts, unit='ms').strftime('%H:%M:%S')
-                    print(f"[{time_str}] 🟢 ENTER LONG: Bought 1 {target_symbol} at {entry_price}")
-            
-            # 2. Position Management
-            if position > 0:
-                current_bid = self.engine.get_best_bid(target_symbol)
-                if current_bid > 0:
-                    # Update highest price for trailing stop
-                    if current_bid > highest_price:
-                        highest_price = current_bid
+            # Check minute boundary to evaluate AI
+            if current_ts % 60000 == 0:
+                # Get features up to current minute
+                df_slice = self.df_intraday[self.df_intraday['time_ms'] <= current_ts]
+                
+                if len(df_slice) >= 40: # WINDOW_SIZE = 40
+                    df_window = df_slice.tail(40).copy()
                     
-                    # Calculate Trailing Stop Level
-                    trailing_stop = highest_price - trailing_stop_points
+                    for missing_col in self.feature_cols:
+                        if missing_col not in df_window.columns:
+                            df_window[missing_col] = 0.0
+
+                    df_window = df_window[self.feature_cols].copy()
                     
-                    # Exit Logic: Trailing Stop Triggered or EOD (13:30)
-                    time_str = pd.to_datetime(current_ts, unit='ms').strftime('%H:%M:%S')
-                    exit_reason = None
+                    # Normalize (Same as live_option_simulator_v2.py)
+                    for col in ['mock_volume', 'macd_hist', 'vwap_bias']:
+                        if col in df_window.columns:
+                            df_window[col] = np.sign(df_window[col]) * np.log1p(np.abs(df_window[col]))
+
+                    feat_tensor = torch.tensor(np.nan_to_num((df_window.values - self.mean_v) / np.where(self.std_v == 0, 1.0, self.std_v), nan=0.0), dtype=torch.float32).unsqueeze(0)
+
+                    with torch.no_grad():
+                        probs = torch.softmax(self.ai_model(feat_tensor), dim=1).squeeze().cpu().numpy()
                     
-                    if current_ts >= exit_time_ms:
-                        exit_reason = "EOD Force Close"
-                    elif current_bid <= trailing_stop:
-                        exit_reason = f"Trailing Stop Triggered (Highest: {highest_price}, SL: {trailing_stop})"
+                    # Strategy Evaluation
+                    signal = self.strategy_engine.generate_signal(df_slice, ai_score=probs, last_win=last_trade_win)
+                    
+                    # Check Exit (EOD or SL/TP)
+                    if position != 0:
+                        current_bid = self.engine.get_best_bid(active_symbol)
+                        current_ask = self.engine.get_best_ask(active_symbol)
+                        current_opt_price = current_bid if position > 0 else current_ask
                         
-                    if exit_reason:
-                        exit_price = current_bid
-                        points_gained = exit_price - entry_price
-                        trade_pnl = points_gained * 50  # 1 point = 50 TWD
-                        pnl += trade_pnl
+                        exit_reason = None
+                        if current_dt.time() >= datetime.strptime("13:30:00", "%H:%M:%S").time():
+                            exit_reason = "EOD Force Close"
+                        elif current_opt_price <= hard_sl_price:
+                            exit_reason = f"SL Triggered ({hard_sl_price})"
+                        elif current_opt_price >= hard_tp_price:
+                            exit_reason = f"TP Triggered ({hard_tp_price})"
+                            
+                        if exit_reason:
+                            exit_price = current_opt_price
+                            points = exit_price - entry_price if position > 0 else entry_price - exit_price
+                            trade_pnl = points * 50
+                            pnl += trade_pnl
+                            last_trade_win = trade_pnl > 0
+                            time_str = current_dt.strftime('%H:%M:%S')
+                            print(f"[{time_str}] 🔴 EXIT {active_symbol}: Sold at {exit_price} | Reason: {exit_reason} | PnL: NT$ {trade_pnl:,.0f}")
+                            
+                            trade_log.append({
+                                'entry_time': entry_time,
+                                'exit_time': current_dt.strftime('%H:%M:%S'),
+                                'symbol': active_symbol,
+                                'type': 'Call' if 'C' in active_symbol else 'Put',
+                                'entry_price': entry_price,
+                                'exit_price': exit_price,
+                                'pnl': trade_pnl
+                            })
+                            position = 0
+                            active_symbol = None
+                    
+                    # Check Entry
+                    if position == 0 and signal != 0 and current_dt.time() < datetime.strptime("13:25:00", "%H:%M:%S").time():
+                        opt_type = 'Call' if signal > 0 else 'Put'
+                        symbol_list = top_contracts['calls'] if opt_type == 'Call' else top_contracts['puts']
+                        active_symbol = symbol_list[0] if symbol_list else None
                         
-                        print(f"[{time_str}] 🔴 EXIT LONG: Sold 1 {target_symbol} at {exit_price}")
-                        print(f"   ↳ Reason: {exit_reason}")
-                        print(f"   ↳ PnL: NT$ {trade_pnl:,.0f} ({points_gained} pts)")
-                        
-                        trade_log.append({
-                            'entry_price': entry_price,
-                            'exit_price': exit_price,
-                            'pnl': trade_pnl
-                        })
-                        
-                        position = 0 # Clear position
-            
-            # Example MTM snapshot printing every 30 mins
-            if current_ts % 1800000 == 0:
-                mtm = self.engine.get_contract_mtm(target_symbol, position if position != 0 else 1)
-                time_str = pd.to_datetime(current_ts, unit='ms').strftime('%H:%M:%S')
-                print(f"⏱️ [{time_str}] MTM Tracker -> Best Bid: {self.engine.get_best_bid(target_symbol)}, Best Ask: {self.engine.get_best_ask(target_symbol)}")
-            
+                        if active_symbol:
+                            ask_price = self.engine.get_best_ask(active_symbol)
+                            if ask_price > 0:
+                                position = 1 if signal > 0 else -1
+                                entry_price = ask_price
+                                entry_time = current_dt.strftime('%H:%M:%S')
+                                
+                                # Use Dynamic BSM for Bounds
+                                S = df_slice.iloc[-1]['Close']
+                                K = self.extract_strike_from_symbol(active_symbol)
+                                T = 2.0 / 365.0 # Mock DTE
+                                r = 0.015
+                                iv = 0.20
+                                atr = df_slice.iloc[-1].get('atr', 20.0)
+                                tp_mult, sl_mult = 2.0, 1.0
+                                
+                                bounds = get_dynamic_bsm_bounds(S, K, T, r, iv, atr, tp_mult, sl_mult, 2.0, option_type=opt_type, actual_entry_price=entry_price)
+                                hard_tp_price, hard_sl_price, _, _, _ = bounds
+                                
+                                print(f"[{entry_time}] 🟢 ENTER {opt_type}: Bought 1 {active_symbol} at {entry_price} | SL: {hard_sl_price:.1f}, TP: {hard_tp_price:.1f}")
+                                
             current_ts += 1000 # Step 1 second
             
         print("\n" + "="*50)
         print("📊 Backtest Simulation Complete")
         print(f"💰 Total PnL: NT$ {pnl:,.0f}")
         print("="*50 + "\n")
+        
+        return trade_log, self.df_intraday
 
 if __name__ == "__main__":
     sim = OptionsSimulator("2026-06-11")
