@@ -109,8 +109,8 @@ class OptionsSimulator:
                     calls = available_symbols
                 
                 return {
-                    'calls': calls[:3],
-                    'puts': puts[:3]
+                    'calls': calls[:4],
+                    'puts': puts[:4]
                 }
         except Exception as e:
             print(f"Failed to query distinct symbols: {e}")
@@ -122,8 +122,8 @@ class OptionsSimulator:
             # Round to nearest 100
             base_strike = int(round(open_price / 100.0) * 100)
             
-        c_strikes = [base_strike, base_strike + 100, base_strike + 200]
-        p_strikes = [base_strike, base_strike - 100, base_strike - 200]
+        c_strikes = [base_strike - 100, base_strike, base_strike + 100, base_strike + 200]
+        p_strikes = [base_strike + 100, base_strike, base_strike - 100, base_strike - 200]
             
         return {
             'calls': [f'TXO{s}C' for s in c_strikes],
@@ -191,9 +191,9 @@ class OptionsSimulator:
         all_symbols = top_contracts['calls'] + top_contracts['puts']
         if not all_symbols:
             print("No contracts found to simulate.")
-            return []
+            return [], self.df_intraday, {}, pd.DataFrame()
             
-        self.load_ticks_to_engine(all_symbols)
+        df_ticks = self.load_ticks_to_engine(all_symbols)
         
         start_ts = int(pd.to_datetime(f"{self.target_date} 08:45:00").timestamp() * 1000)
         end_ts = int(pd.to_datetime(f"{self.target_date} 13:45:00").timestamp() * 1000)
@@ -316,7 +316,7 @@ class OptionsSimulator:
         print(f"💰 Total PnL: NT$ {pnl:,.0f}")
         print("="*50 + "\n")
         
-        return trade_log, self.df_intraday
+        return trade_log, self.df_intraday, top_contracts, df_ticks
 
 if __name__ == "__main__":
     sim = OptionsSimulator("2026-06-11")
