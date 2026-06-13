@@ -12,6 +12,9 @@ if base_dir not in sys.path:
     sys.path.append(base_dir)
 
 from core.simulator import OptionsSimulator
+import importlib
+if 'core.simulator' in sys.modules:
+    importlib.reload(sys.modules['core.simulator'])
 
 st.set_page_config(page_title="AI 選擇權回測視覺化儀表板", layout="wide")
 
@@ -170,26 +173,26 @@ if st.session_state.run_complete:
         with col_c:
             st.write("📈 **多方 (Call) 前 4 名**")
             for c in top_contracts.get('calls', []):
-                st.code(c)
+                st.code(f"{c['symbol']} (交易量: {c['volume']:,})")
         with col_p:
             st.write("📉 **空方 (Put) 前 4 名**")
             for p in top_contracts.get('puts', []):
-                st.code(p)
+                st.code(f"{p['symbol']} (交易量: {p['volume']:,})")
                 
         # 4. 互動式自訂交易模擬
         st.markdown("---")
-        st.subheader("🕹️ 自訂交易模擬與特徵觀察 (Interactive Manual Simulator)")
-        st.markdown("您可以從上方主力合約中選擇一個，並自行設定買入與賣出時間，觀察 PnL 變化以及在該時刻的 AI 特徵狀態。")
+        st.subheader("🕹️ 量化自訂交易模擬與特徵觀察 (Interactive Quant Simulator)")
+        st.markdown("您可以從上方主力合約中選擇一個，並自行設定精確至「秒」的買入與賣出時間，觀察 PnL 變化、MFE/MAE、交易成本估算以及進場當下的 Options Greeks。")
         
-        all_options = top_contracts.get('calls', []) + top_contracts.get('puts', [])
+        all_options = [c['symbol'] for c in top_contracts.get('calls', [])] + [p['symbol'] for p in top_contracts.get('puts', [])]
         if all_options and not df_ticks.empty:
             sel_contract = st.selectbox("選擇要模擬的選擇權合約", options=all_options)
             
             col_t1, col_t2 = st.columns(2)
             with col_t1:
-                manual_entry = st.time_input("設定進場時間", value=time(9, 0))
+                manual_entry = st.time_input("設定進場時間", value=time(9, 0), step=1)
             with col_t2:
-                manual_exit = st.time_input("設定出場時間", value=time(9, 30))
+                manual_exit = st.time_input("設定出場時間", value=time(9, 30), step=1)
                 
             if manual_entry >= manual_exit:
                 st.warning("⚠️ 進場時間必須早於出場時間！")
@@ -216,7 +219,22 @@ if st.session_state.run_complete:
                         m_entry_price = entry_row['ask_price'] if entry_row['ask_price'] > 0 else entry_row['price']
                         m_exit_price = exit_row['bid_price'] if exit_row['bid_price'] > 0 else exit_row['price']
                         
-                        m_pnl = (m_exit_price - m_entry_price) * 50
+                        trade_window = df_sym_ticks[(df_sym_ticks['time_only'] >= entry_row['time_only']) & (df_sym_ticks['time_only'] <= exit_row['time_only'])]
+                        
+                        # Quantitative Analysis
+                        FEE_AND_SLIPPAGE = 100 # 假設單口來回手續費與滑價總和
+                        multiplier = 50 # 台指選擇權乘數
+                        opt_direction = 1 if "C" in sel_contract else -1 # 買進 Call 賺上漲，買進 Put 賺上漲 (因為我們都是作買方)
+                        
+                        # 以買方角度，價格越高越賺
+                        m_gross_pnl = (m_exit_price - m_entry_price) * multiplier
+                        m_net_pnl = m_gross_pnl - FEE_AND_SLIPPAGE
+                        
+                        max_price = trade_window['price'].max()
+                        min_price = trade_window['price'].min()
+                        
+                        mfe = (max_price - m_entry_price) * multiplier
+                        mae = (min_price - m_entry_price) * multiplier
                         
                         # 畫出合約走勢與模擬進出場
                         fig_opt = go.Figure()
@@ -230,25 +248,54 @@ if st.session_state.run_complete:
                         # 進場點
                         fig_opt.add_trace(go.Scatter(
                             x=[entry_row['time']], y=[m_entry_price],
-                            mode='markers', name='手動買進',
+                            mode='markers', name='手動買進 (Ask)',
                             marker=dict(symbol='star', color='#00FF00', size=16, line=dict(width=1, color='white'))
                         ))
                         # 出場點
                         fig_opt.add_trace(go.Scatter(
                             x=[exit_row['time']], y=[m_exit_price],
-                            mode='markers', name='手動賣出',
+                            mode='markers', name='手動賣出 (Bid)',
                             marker=dict(symbol='x', color='#FF0000', size=14, line=dict(width=1, color='white'))
                         ))
                         fig_opt.update_layout(height=400, template='plotly_dark', title=f"{sel_contract} 合約走勢與手動模擬", hovermode="x unified")
                         st.plotly_chart(fig_opt, use_container_width=True)
                         
-                        st.success(f"**模擬結果**：買進價 {m_entry_price:.1f} ➡️ 賣出價 {m_exit_price:.1f} │ 模擬損益：NT$ {m_pnl:,.0f}")
+                        # 顯示 Quant KPI
+                        st.markdown("#### ⚙️ 模擬交易量化指標 (Quant Metrics)")
+                        col_q1, col_q2, col_q3, col_q4 = st.columns(4)
+                        col_q1.metric("買進價 (Ask)", f"{m_entry_price:.1f}")
+                        col_q2.metric("賣出價 (Bid)", f"{m_exit_price:.1f}")
+                        col_q3.metric("淨損益 (扣除成本 NT$100)", f"NT$ {m_net_pnl:,.0f}")
+                        col_q4.metric("最佳/最差偏移 (MFE / MAE)", f"{mfe:,.0f} / {mae:,.0f}")
+                        
+                        # 顯示 Greeks
+                        st.markdown("#### 📐 進場當下選擇權希臘字母 (Options Greeks)")
+                        try:
+                            from delta_gamma_theta import calculate_bs_greeks
+                            import re
+                            idx_in = df_intraday[df_intraday['time'] >= manual_entry].first_valid_index()
+                            S = df_intraday.loc[idx_in, 'Close'] if idx_in is not None else m_entry_price
+                            iv = df_intraday.loc[idx_in, 'atr'] / 100.0 if idx_in is not None else 0.20 # 簡單用 ATR 推估或固定 0.2
+                            if iv > 1.0 or iv < 0.05: iv = 0.20 # 防呆
+                            
+                            match = re.search(r'\d+', sel_contract)
+                            K = float(match.group()) if match else 15000.0
+                            opt_type = "Call" if "C" in sel_contract else "Put"
+                            
+                            delta, gamma, theta_decay, theo_price = calculate_bs_greeks(S, K, 2.0/365.0, 0.015, iv, option_type=opt_type)
+                            
+                            cg1, cg2, cg3, cg4 = st.columns(4)
+                            cg1.metric("Underlying S", f"{S:.1f}")
+                            cg2.metric("Δ Delta", f"{delta:.4f}")
+                            cg3.metric("Γ Gamma", f"{gamma:.6f}")
+                            cg4.metric("Θ Theta (Daily)", f"{theta_decay:.2f}")
+                        except Exception as greek_err:
+                            st.info(f"無法計算 Greeks: {greek_err}")
                         
                         # 特徵對比
                         st.markdown("#### 🔍 進出場時的 AI 特徵狀態對比")
                         
                         # 在 intraday 中找到最接近的 K 線
-                        idx_in = df_intraday[df_intraday['time'] >= manual_entry].first_valid_index()
                         idx_out = df_intraday[df_intraday['time'] >= manual_exit].first_valid_index()
                         
                         if idx_in is not None and idx_out is not None:
