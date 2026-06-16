@@ -98,19 +98,25 @@ class OptionsSimulator:
         try:
             if not self.db.conn:
                 self.db.connect()
-            query = "SELECT DISTINCT symbol FROM options_ticks WHERE time >= %s AND time <= %s"
+            query = """
+                SELECT symbol, SUM(volume) as total_vol 
+                FROM options_ticks 
+                WHERE time >= %s AND time <= %s 
+                GROUP BY symbol 
+                ORDER BY total_vol DESC
+            """
             df_symbols = pd.read_sql_query(query, self.db.conn, params=[start_time, end_time])
-            available_symbols = df_symbols['symbol'].tolist()
             
-            if available_symbols:
-                calls = [s for s in available_symbols if s.endswith('C') or 'C' in s]
-                puts = [s for s in available_symbols if s.endswith('P') or 'P' in s]
-                if not calls and not puts:
-                    calls = available_symbols
+            if not df_symbols.empty:
+                calls = df_symbols[df_symbols['symbol'].str.contains('C|c')]
+                puts = df_symbols[df_symbols['symbol'].str.contains('P|p')]
+                
+                call_list = [{'symbol': row['symbol'], 'volume': int(row['total_vol'])} for _, row in calls.head(4).iterrows()]
+                put_list = [{'symbol': row['symbol'], 'volume': int(row['total_vol'])} for _, row in puts.head(4).iterrows()]
                 
                 return {
-                    'calls': calls[:4],
-                    'puts': puts[:4]
+                    'calls': call_list,
+                    'puts': put_list
                 }
         except Exception as e:
             print(f"Failed to query distinct symbols: {e}")
@@ -125,9 +131,11 @@ class OptionsSimulator:
         c_strikes = [base_strike - 100, base_strike, base_strike + 100, base_strike + 200]
         p_strikes = [base_strike + 100, base_strike, base_strike - 100, base_strike - 200]
             
+        # Mock volumes for fallback
+        vols = [15000, 12000, 8000, 4000]
         return {
-            'calls': [f'TXO{s}C' for s in c_strikes],
-            'puts': [f'TXO{s}P' for s in p_strikes]
+            'calls': [{'symbol': f'TXO{s}C', 'volume': v} for s, v in zip(c_strikes, vols)],
+            'puts': [{'symbol': f'TXO{s}P', 'volume': v} for s, v in zip(p_strikes, vols)]
         }
 
     def load_ticks_to_engine(self, symbols: list):
@@ -188,7 +196,7 @@ class OptionsSimulator:
             return [], pd.DataFrame(), {}, pd.DataFrame()
             
         top_contracts = self.find_top_volume_contracts()
-        all_symbols = top_contracts['calls'] + top_contracts['puts']
+        all_symbols = [c['symbol'] for c in top_contracts['calls']] + [p['symbol'] for p in top_contracts['puts']]
         if not all_symbols:
             print("No contracts found to simulate.")
             return [], self.df_intraday, {}, pd.DataFrame()
@@ -221,6 +229,7 @@ class OptionsSimulator:
             current_dt = pd.to_datetime(current_ts, unit='ms')
             
             # Check minute boundary to evaluate AI
+            signal = 0
             if current_ts % 60000 == 0:
                 # Get features up to current minute
                 df_slice = self.df_intraday[self.df_intraday['time_ms'] <= current_ts]
@@ -247,67 +256,90 @@ class OptionsSimulator:
                     # Strategy Evaluation
                     signal = self.strategy_engine.generate_signal(df_slice, ai_score=probs, last_win=last_trade_win)
                     
-                    # Check Exit (EOD or SL/TP)
-                    if position != 0:
-                        current_bid = self.engine.get_best_bid(active_symbol)
-                        current_ask = self.engine.get_best_ask(active_symbol)
-                        current_opt_price = current_bid if position > 0 else current_ask
-                        
-                        exit_reason = None
-                        if current_dt.time() >= datetime.strptime("13:30:00", "%H:%M:%S").time():
-                            exit_reason = "EOD Force Close"
-                        elif current_opt_price <= hard_sl_price:
-                            exit_reason = f"SL Triggered ({hard_sl_price})"
-                        elif current_opt_price >= hard_tp_price:
-                            exit_reason = f"TP Triggered ({hard_tp_price})"
-                            
-                        if exit_reason:
-                            exit_price = current_opt_price
-                            points = exit_price - entry_price if position > 0 else entry_price - exit_price
-                            trade_pnl = points * 50
-                            pnl += trade_pnl
-                            last_trade_win = trade_pnl > 0
-                            time_str = current_dt.strftime('%H:%M:%S')
-                            print(f"[{time_str}] 🔴 EXIT {active_symbol}: Sold at {exit_price} | Reason: {exit_reason} | PnL: NT$ {trade_pnl:,.0f}")
-                            
-                            trade_log.append({
-                                'entry_time': entry_time,
-                                'exit_time': current_dt.strftime('%H:%M:%S'),
-                                'symbol': active_symbol,
-                                'type': 'Call' if 'C' in active_symbol else 'Put',
-                                'entry_price': entry_price,
-                                'exit_price': exit_price,
-                                'pnl': trade_pnl
-                            })
-                            position = 0
-                            active_symbol = None
+            # Check Exit (EOD or SL/TP) EVERY SECOND
+            if position != 0:
+                current_bid = self.engine.get_best_bid(active_symbol)
+                current_ask = self.engine.get_best_ask(active_symbol)
+                current_opt_price = current_bid if position > 0 else current_ask
+                
+                exit_reason = None
+                if current_dt.time() >= datetime.strptime("13:30:00", "%H:%M:%S").time():
+                    exit_reason = "EOD Force Close"
+                elif current_opt_price <= hard_sl_price:
+                    exit_reason = f"SL Triggered ({hard_sl_price})"
+                elif current_opt_price >= hard_tp_price:
+                    exit_reason = f"TP Triggered ({hard_tp_price})"
                     
-                    # Check Entry
-                    if position == 0 and signal != 0 and current_dt.time() < datetime.strptime("13:25:00", "%H:%M:%S").time():
-                        opt_type = 'Call' if signal > 0 else 'Put'
-                        symbol_list = top_contracts['calls'] if opt_type == 'Call' else top_contracts['puts']
-                        active_symbol = symbol_list[0] if symbol_list else None
+                    if exit_reason:
+                        exit_price = current_opt_price
+                        points = exit_price - entry_price if position > 0 else entry_price - exit_price
+                        trade_pnl = points * 50
+                        pnl += trade_pnl
+                        last_trade_win = trade_pnl > 0
+                        time_str = current_dt.strftime('%H:%M:%S')
+                        print(f"[{time_str}] 🔴 EXIT {active_symbol}: Sold at {exit_price} | Reason: {exit_reason} | PnL: NT$ {trade_pnl:,.0f}")
                         
-                        if active_symbol:
-                            ask_price = self.engine.get_best_ask(active_symbol)
-                            if ask_price > 0:
-                                position = 1 if signal > 0 else -1
-                                entry_price = ask_price
-                                entry_time = current_dt.strftime('%H:%M:%S')
-                                
-                                # Use Dynamic BSM for Bounds
-                                S = df_slice.iloc[-1]['Close']
-                                K = self.extract_strike_from_symbol(active_symbol)
-                                T = 2.0 / 365.0 # Mock DTE
-                                r = 0.015
-                                iv = 0.20
-                                atr = df_slice.iloc[-1].get('atr', 20.0)
-                                tp_mult, sl_mult = 2.0, 1.0
-                                
-                                bounds = get_dynamic_bsm_bounds(S, K, T, r, iv, atr, tp_mult, sl_mult, 2.0, option_type=opt_type, actual_entry_price=entry_price)
-                                hard_tp_price, hard_sl_price, _, _, _ = bounds
-                                
-                                print(f"[{entry_time}] 🟢 ENTER {opt_type}: Bought 1 {active_symbol} at {entry_price} | SL: {hard_sl_price:.1f}, TP: {hard_tp_price:.1f}")
+                        trade_record = {
+                            'entry_time': entry_time,
+                            'exit_time': current_dt.strftime('%H:%M:%S'),
+                            'symbol': active_symbol,
+                            'type': 'Call' if 'C' in active_symbol else 'Put',
+                            'entry_price': entry_price,
+                            'exit_price': exit_price,
+                            'pnl': trade_pnl,
+                            'strategy_label': strategy_label
+                        }
+                        # Add entry features to the record
+                        if entry_features:
+                            for k, v in entry_features.items():
+                                trade_record[k] = v
+
+                        trade_log.append(trade_record)
+                        position = 0
+                        active_symbol = None
+                        strategy_label = None
+                        entry_features = {}
+                        signal = 0 # Prevent immediate re-entry in the same second
+                
+                # Check Entry
+                if position == 0 and signal != 0 and current_dt.time() < datetime.strptime("13:25:00", "%H:%M:%S").time():
+                            opt_type = 'Call' if signal > 0 else 'Put'
+                            symbol_list = top_contracts['calls'] if opt_type == 'Call' else top_contracts['puts']
+                            active_symbol = symbol_list[0]['symbol'] if symbol_list else None
+                            
+                            if active_symbol:
+                                ask_price = self.engine.get_best_ask(active_symbol)
+                                if ask_price > 0:
+                                    position = 1 if signal > 0 else -1
+                                    entry_price = ask_price
+                                    entry_time = current_dt.strftime('%H:%M:%S')
+
+                                    if abs(signal) == 10:
+                                        strategy_label = f"⚡ Level 10 V轉極速剝頭皮 (Buy {opt_type})"
+                                    elif abs(signal) == 4:
+                                        strategy_label = f"🧲 Level 4 流動性吸收 (Buy {opt_type})"
+                                    elif abs(signal) == 3:
+                                        strategy_label = f"🚀 Level 3 極強勢波段 (Buy {opt_type})"
+                                    elif abs(signal) == 2:
+                                        strategy_label = f"📈 Level 2 標準波段 (Buy {opt_type})"
+                                    else:
+                                        strategy_label = f"⚡ Level 1 短線游擊 (Buy {opt_type})"
+                                    
+                                    entry_features = df_slice.iloc[-1].to_dict() if not df_slice.empty else {}
+                                    
+                                    # Use Dynamic BSM for Bounds
+                                    S = df_slice.iloc[-1]['Close'] if not df_slice.empty else 15000.0
+                                    K = self.extract_strike_from_symbol(active_symbol)
+                                    T = 2.0 / 365.0 # Mock DTE
+                                    r = 0.015
+                                    iv = 0.20
+                                    atr = df_slice.iloc[-1].get('atr', 20.0) if not df_slice.empty else 20.0
+                                    tp_mult, sl_mult = 2.0, 1.0
+                                    
+                                    bounds = get_dynamic_bsm_bounds(S, K, T, r, iv, atr, tp_mult, sl_mult, 2.0, option_type=opt_type, actual_entry_price=entry_price)
+                                    hard_tp_price, hard_sl_price, _, _, _ = bounds
+                                    
+                                    print(f"[{entry_time}] 🟢 ENTER {opt_type} ({strategy_label}): Bought 1 {active_symbol} at {entry_price} | SL: {hard_sl_price:.1f}, TP: {hard_tp_price:.1f}")
                                 
             current_ts += 1000 # Step 1 second
             

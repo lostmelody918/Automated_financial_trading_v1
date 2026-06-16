@@ -129,6 +129,50 @@ class KBarAccumulator:
             self.V += volume
             return None
 
+def get_tier_based_tp_sl(entry_price, abs_sig, is_trailing=False):
+    """
+    依據選擇權成交價給定停損停利基準點數，並配合交易策略強度調整。
+    區分級距: <10, 10-30, 30-60, 60-100, 100-180, 180-250, 250-400, 400-600, >=600
+    """
+    if entry_price < 10:
+        base_tp, base_sl = 9.0, 2.5
+    elif entry_price < 30:
+        base_tp, base_sl = 12.0, 8.0
+    elif entry_price < 60:
+        base_tp, base_sl = 21.0, 13.0
+    elif entry_price < 100:
+        base_tp, base_sl = 35.0, 21.0
+    elif entry_price < 180:
+        base_tp, base_sl = 60.0, 28.0
+    elif entry_price < 250:
+        base_tp, base_sl = 75.0, 32.0
+    elif entry_price < 400:
+        base_tp, base_sl = 111.0, 43.0
+    elif entry_price < 600:
+        base_tp, base_sl = 160.0, 68.0
+    else:
+        base_tp, base_sl = 250.0, 81.0
+
+    if abs_sig == 10:
+        tp_adj, sl_adj = 0.8, 1.2
+    elif abs_sig >= 3:
+        tp_adj, sl_adj = 1.5, 1.5
+    elif abs_sig == 2:
+        tp_adj, sl_adj = 1.2, 1.2
+    elif abs_sig == 1:
+        tp_adj, sl_adj = 1.0, 1.0
+    else:
+        tp_adj, sl_adj = 0.8, 0.8
+
+    final_tp_pts = base_tp * tp_adj
+    final_sl_pts = base_sl * sl_adj
+
+    if is_trailing:
+        final_tp_pts *= 0.9
+        final_sl_pts *= 0.8
+
+    return final_tp_pts, final_sl_pts
+
 def is_market_open(current_time):
     return datetime_time(8, 45) <= current_time <= datetime_time(13, 45)
 
@@ -179,13 +223,39 @@ def generate_eod_report(trade_log, initial_capital, current_capital, out_dir="da
     else: print("❌ 今日無交易紀錄。")
     print("="*60 + "\n")
 
-def calculate_features(df_raw):
+def calculate_features(df_raw, settlement_calendar=None):
     df = df_raw.copy()
     if df.empty: return df
 
     df['time'] = df['date'].dt.time
     df['date_only'] = df['date'].dt.date
     df['day_of_week'] = df['date'].dt.dayofweek
+
+    # [ 新增時間感知特徵 ]
+    df['settlement_type'] = 0
+    df['is_settlement_day'] = 0
+    df['dte'] = 5.0
+
+    if settlement_calendar:
+        for d in df['date_only'].unique():
+            d_str = d.strftime('%Y-%m-%d')
+            future_dte = 5.0
+            found_type = 0
+            for i in range(15):
+                f_d = d + pd.Timedelta(days=i)
+                f_str = f_d.strftime('%Y-%m-%d')
+                if f_str in settlement_calendar:
+                    future_dte = float(i)
+                    found_type = settlement_calendar[f_str]
+                    break
+            mask = df['date_only'] == d
+            df.loc[mask, 'settlement_type'] = found_type
+            df.loc[mask, 'is_settlement_day'] = 1 if future_dte == 0.0 else 0
+
+            # 精確計算 dte
+            time_diff = pd.to_datetime(d_str + ' 13:30:00') - df.loc[mask, 'date']
+            time_diff_days = time_diff.dt.total_seconds() / 86400.0
+            df.loc[mask, 'dte'] = (future_dte + time_diff_days).clip(lower=0.001)
 
     df['ret'] = df['Close'].pct_change()
     df['mock_volume'] = df['Volume'].replace(0, 1)
@@ -256,11 +326,11 @@ def calculate_features(df_raw):
     # 尋找反曲點 (找轉折)
     df['is_peak'] = (df['smooth_price'].shift(1) > df['smooth_price'].shift(2)) & (df['smooth_price'].shift(1) > df['smooth_price'])
     df['is_trough'] = (df['smooth_price'].shift(1) < df['smooth_price'].shift(2)) & (df['smooth_price'].shift(1) < df['smooth_price'])
-    
+
     # 記錄前一次轉折點的值
     df['recent_peak_val'] = df['smooth_price'].where(df['is_peak']).ffill()
     df['recent_trough_val'] = df['smooth_price'].where(df['is_trough']).ffill()
-    
+
     # 判斷突破 (1: 突破前高, -1: 跌破前低, 0: 區間內)
     df['inflection_breakout'] = np.where(df['Close'] > df['recent_peak_val'], 1,
                                   np.where(df['Close'] < df['recent_trough_val'], -1, 0))
@@ -358,9 +428,31 @@ def run_live_simulator():
     last_trade_pnl = 0.0
     trade_log = []
     eod_report_done = False
+    
+    # --- Recovery Logic (防止重開導致當日已平倉資料與損益遺失) ---
+    try:
+        from post_market_export import PostMarketExporter
+        import json
+        exporter = PostMarketExporter()
+        today_str = datetime.now().strftime('%Y%m%d')
+        recovered_trades_file = os.path.join(exporter.export_dir, f"cli_trade_log_{today_str}.jsonl")
+        if os.path.exists(recovered_trades_file):
+            with open(recovered_trades_file, 'r', encoding='utf-8') as f:
+                for line in f:
+                    if line.strip():
+                        trade_log.append(json.loads(line))
+            if trade_log:
+                total_pnl = sum([t.get('pnl', 0) for t in trade_log])
+                current_capital = INITIAL_CAPITAL + total_pnl
+                print(f"🔄 成功從歷史紀錄還原 {len(trade_log)} 筆今日交易。還原後最新本金: NT$ {current_capital:,.0f}")
+    except Exception as e:
+        print(f"⚠️ 還原今日交易紀錄失敗: {e}")
+        
     entry_features = {}
 
     df_chips_daily = load_latest_daily_chips_snapshot()
+    # 建立動態交割日曆
+    settlement_calendar = engine.build_settlement_calendar()
 
     print("📥 正在獲取初始 5 天 K 線歷史資料...")
     today = datetime.now()
@@ -482,6 +574,10 @@ def run_live_simulator():
                 trade_log = []
                 is_today_settlement = None
 
+        # 在 is_market_open(current_time) 前面可以設定一個 last_export_time
+        if 'last_export_time' not in locals():
+            last_export_time = current_time
+
         if is_today_settlement is None and is_market_open(current_time):
             try:
                 temp_contract = engine.get_best_volume_option_contract(option_type='Call', allocated_capital=100000)
@@ -494,14 +590,20 @@ def run_live_simulator():
                 print(f"⚠️ 無法判斷結算日: {e}")
                 is_today_settlement = False
 
-        if is_eod_closing_time(now, is_settlement=is_today_settlement) and pos_manager.get('position') == 0 and not eod_report_done:
-            generate_eod_report(trade_log, INITIAL_CAPITAL, current_capital)
+        # 每 30 分鐘定期匯出 (例如 HH:00 或 HH:30 附近，或超過 30 分鐘未匯出)
+        if (current_time - last_export_time).total_seconds() >= 1800 or (is_eod_closing_time(now, is_settlement=is_today_settlement) and pos_manager.get('position') == 0 and not eod_report_done):
             
-            # --- 新增：匯出盤後資料與視覺化報表 ---
+            is_eod = is_eod_closing_time(now, is_settlement=is_today_settlement)
+            
+            if is_eod and pos_manager.get('position') == 0 and not eod_report_done:
+                generate_eod_report(trade_log, INITIAL_CAPITAL, current_capital)
+                eod_report_done = True
+                
+            # --- 匯出盤後/定期資料與視覺化報表 ---
             try:
                 from post_market_export import PostMarketExporter
                 exporter = PostMarketExporter()
-                
+
                 dict_options_history = {}
                 # 由於這裡無法直接簡單取得 Option K線，我們傳入空的 DataFrame 或依賴先前的資料
                 # 對於實際應用，可以透過 engine.api.kbars(symbol) 來補齊
@@ -509,21 +611,22 @@ def run_live_simulator():
                 traded_symbols = set([t.get('symbol') for t in trade_log if t.get('symbol')])
                 for sym in traded_symbols:
                     dict_options_history[sym] = pd.DataFrame()
-                    
+
                 # df_intraday 在這邊不一定被定義，我們使用 df_raw 或是全域維護的特徵 df
                 if 'df_intraday' in locals() and df_intraday is not None and not df_intraday.empty:
                     df_to_export = df_intraday
                 else:
                     df_to_export = df_raw
-                    
+
                 exporter.execute_export(df_to_export, dict_options_history, trade_log)
+                last_export_time = current_time # 更新最後匯出時間
             except Exception as exp_err:
-                print(f"⚠️ 匯出盤後資料失敗: {exp_err}")
+                print(f"⚠️ 匯出盤後/定期資料失敗: {exp_err}")
             # ----------------------------------------
-            
-            eod_report_done = True
-            time.sleep(300)
-            continue
+
+            if is_eod:
+                time.sleep(300)
+                continue
 
         try:
             q_timeout = 1.0 if is_market_open(current_time) else 5.0
@@ -540,7 +643,7 @@ def run_live_simulator():
                     new_row = pd.DataFrame([bar])
                     df_raw = pd.concat([df_raw, new_row], ignore_index=True)
 
-                    df_intraday = calculate_features(df_raw)
+                    df_intraday = calculate_features(df_raw, settlement_calendar=settlement_calendar)
                     if df_intraday is None or df_intraday.empty:
                         continue
 
@@ -592,6 +695,33 @@ def run_live_simulator():
                                 current_opt_price = 'N/A'
 
                         print(f"[{time_str}] 🤖 AI 預測完成: Class={max_idx-3} ({class_name}), Confidence={confidence:.2%} | 📊 持倉: {sym} (現價: {current_opt_price}, 進: {ep}, 高: {hp}, 防: {sl:.1f}, 利: {tp})")
+
+                        # 動態調整持倉的停損停利 (依據最新 AI 預測強度)
+                        ai_pred_val = max_idx - 3
+                        strength = ai_pred_val if pos == 1 else -ai_pred_val
+
+                        new_tp, new_sl = tp, sl
+                        if strength <= 0:
+                            if hp > ep + 10:
+                                new_sl = max(sl, ep + 2)
+                            else:
+                                new_sl = max(sl, ep - (ep - sl)*0.5)
+                            new_tp = ep + 5
+                        elif strength == 1:
+                            if hp > ep + 15:
+                                new_sl = max(sl, ep + 5)
+                            new_tp = tp * 0.9
+                        elif strength == 2:
+                            if hp > ep + 20:
+                                new_sl = max(sl, hp - 10)
+                            new_tp = tp * 0.95
+
+                        new_tp = max(new_tp, ep + 3)
+
+                        if new_tp != tp or new_sl != sl:
+                            pos_manager.update(hard_tp_price=new_tp, hard_sl_price=new_sl)
+                            print(f"[{time_str}] ⚠️ AI 預測強度變動 (目前強度: {strength})，動態調整停利為 {new_tp:.1f}，停損收緊至 {new_sl:.1f}")
+
                     else:
                         print(f"[{time_str}] 🤖 AI 預測完成: Class={max_idx-3} ({class_name}), Confidence={confidence:.2%}, Probs={np.round(probs, 3)}")
 
@@ -663,11 +793,11 @@ def run_live_simulator():
                             # 針對不同 Level 設定不同的激進門檻以增加短線與波段的出手次數
                             abs_level = abs(max_trend_idx - 3)
                             if abs_level == 3:
-                                threshold = 0.37 # Level 3 極強勢維持較高標準
+                                threshold = 0.39 # Level 3 極強勢維持較高標準
                             elif abs_level == 2:
-                                threshold = 0.27 # Level 2 標準波段降低至 25%
+                                threshold = 0.29 # Level 2 標準波段
                             else:
-                                threshold = 0.22 # Level 1 短線游擊降低至 20% (從0.22微降)
+                                threshold = 0.23 # Level 1 短線游擊
 
                             # 依據預期持倉時間動態提高門檻 (時間越短，容錯率越低，要求更高的爆發力)
                             if expected_hold_time <= 0.25:
@@ -691,12 +821,20 @@ def run_live_simulator():
                             inf_break = df['inflection_breakout'].iloc[-1]
                             recent_peak = df['recent_peak_val'].iloc[-1]
                             recent_trough = df['recent_trough_val'].iloc[-1]
+                            new_opt_type = None
                             if inf_break == 1 and signal <= 0:
                                 print(f"[{time_str}] 📈 價格突破前次反曲高點 ({recent_peak:.1f})，確認多頭趨勢，產生順勢做多信號！")
                                 signal = 1
+                                new_opt_type = 'Call'
                             elif inf_break == -1 and signal >= 0:
                                 print(f"[{time_str}] 📉 價格跌破前次反曲低點 ({recent_trough:.1f})，確認空頭趨勢，產生順勢做空信號！")
                                 signal = -1
+                                new_opt_type = 'Put'
+
+                            if new_opt_type:
+                                active_contract = engine.get_best_volume_option_contract(option_type=new_opt_type, allocated_capital=allocated_capital_limit)
+                                if not active_contract:
+                                    continue
 
                         if signal != 0:
                             opt_type = 'Call' if signal > 0 else 'Put'
@@ -752,7 +890,7 @@ def run_live_simulator():
                                 tp_mult, sl_mult = 1.5, 1.9
                                 strategy_label = f"⚡ Level 10 V轉極速剝頭皮 (Buy {opt_type})"
                             elif abs_sig == 3:
-                                tp_mult, sl_mult = 4.0, 5.0
+                                tp_mult, sl_mult = 3.8, 3.8
                                 strategy_label = f"🚀 Level 3 極強勢波段 (Buy {opt_type})"
                             elif abs_sig == 2:
                                 tp_mult, sl_mult = 2.2, 3.2
@@ -788,6 +926,15 @@ def run_live_simulator():
                                 actual_entry_price=entry_price,
                                 fee_points=fee_points
                             )
+
+                            # 新增：依據選擇權成交價分級給定停損停利點數，並與 BSM 綜合考量
+                            tier_tp_pts, tier_sl_pts = get_tier_based_tp_sl(entry_price, abs_sig, is_trailing=False)
+                            tier_tp_price = entry_price + tier_tp_pts
+                            tier_sl_price = entry_price - tier_sl_pts
+
+                            # 綜合判斷 (嚴格風險控制：停損取兩者中較高者以提早保護，停利取兩者中較高者讓獲利奔跑)
+                            hard_tp_price = max(hard_tp_price, tier_tp_price)
+                            hard_sl_price = max(hard_sl_price, tier_sl_price)
 
                             expected_profit_points = hard_tp_price - entry_price
                             if expected_profit_points < 3.5:
@@ -877,10 +1024,10 @@ def run_live_simulator():
                         pos_manager.update(highest_price_since_entry=highest_price)
 
                     exit_reason = None
-                    
+
                     # 價格反曲點突破反轉平倉邏輯 (Inflection Breakout Reversal)
                     inf_break = df['inflection_breakout'].iloc[-1] if 'df' in locals() and not df.empty and 'inflection_breakout' in df.columns else 0
-                    
+
                     if is_eod_closing_time(now, is_settlement=is_today_settlement):
                         exit_reason = "尾盤強制平倉 (EOD)"
                     elif position == 1 and inf_break == -1:
@@ -913,8 +1060,8 @@ def run_live_simulator():
                             consecutive_failures[trade_direction] += 1
                             consecutive_total_losses += 1
                             if consecutive_total_losses >= 4:
-                                cooldown_until = now + timedelta(minutes=15)
-                                print(f"\n{'='*40}\n❄️ 【系統冷卻】連續 4 次虧損，暫停交易 15 分鐘！預計於 {cooldown_until.strftime('%H:%M:%S')} 恢復。\n{'='*40}\n")
+                                cooldown_until = now + timedelta(minutes=10)
+                                print(f"\n{'='*40}\n❄️ 【系統冷卻】連續 4 次虧損，暫停交易 10 分鐘！預計於 {cooldown_until.strftime('%H:%M:%S')} 恢復。\n{'='*40}\n")
                         else:
                             consecutive_failures[trade_direction] = 0
                             consecutive_total_losses = 0
@@ -944,7 +1091,7 @@ def run_live_simulator():
                         except Exception as save_err:
                             print(f"⚠️ 即時存檔交易紀錄失敗: {save_err}")
 
-                        print(f"\n{'='*40}\n🔔 【平倉】: {exit_reason}\n實際盈虧: NT$ {current_pnl:,.0f} ({current_ret * 100:.2f}%)\n最新資金: NT$ {current_capital:,.0f}\n{'='*40}\n")
+                        print(f"\n{'='*40}\n🔔 【平倉】: {exit_reason}\n買入價格: {entry_price:.1f} | 平倉價格: {exec_price:.1f}\n實際盈虧: NT$ {current_pnl:,.0f} ({current_ret * 100:.2f}%)\n最新資金: NT$ {current_capital:,.0f}\n{'='*40}\n")
                         pos_manager.clear_position()
                         current_active_code = None
                         entry_features = {}

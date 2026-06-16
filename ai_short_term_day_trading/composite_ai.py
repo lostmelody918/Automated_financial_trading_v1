@@ -2,48 +2,62 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class CompositeDayTradingAI(nn.Module):
+class MultiTimeframeCompositeAI(nn.Module):
     """
-    複合 AI 模型：結合 1D-CNN (擷取微觀 K 線型態如雙底/洗盤)
-    與 Transformer Encoder (處理盤中時序記憶與注意力機制)
-
-    參考華爾街最新高頻實踐：CNN-Transformer 架構。
+    進階多時間尺度 AI 模型：
+    1. 雙分支 1D-CNN：使用 Left-Padding 確保嚴格因果律。
+    2. 可學習位置編碼 (Learnable Positional Encoding)。
+    3. 雙 Transformer 編碼器。
+    4. 特徵拼接 (Concatenation) 與多層感知機 (MLP) 決策。
     """
-    def __init__(self, input_dim, d_model=256, nhead=4, num_layers=2, dropout=0.3): # 增加 dropout
+    def __init__(self, input_dim, d_model=256, nhead=8, num_layers=3, dropout=0.3, seq_len_1m=40, seq_len_15m=20):
         super().__init__()
+        self.d_model = d_model
 
-        # 1D-CNN 特徵萃取器
-        self.conv1 = nn.Conv1d(in_channels=input_dim, out_channels=d_model, kernel_size=3, padding=1)
-        self.bn1 = nn.BatchNorm1d(d_model)
-        self.dropout_cnn = nn.Dropout(dropout)
+        # --- 1分鐘線分支 (微觀) ---
+        # 移除 padding=1，改為手動 left padding 確保因果
+        self.conv1m = nn.Conv1d(in_channels=input_dim, out_channels=d_model, kernel_size=3)
+        self.bn1m = nn.BatchNorm1d(d_model)
+        self.pos_embed_1m = nn.Parameter(torch.zeros(1, seq_len_1m, d_model))
+        
+        encoder_layer_1m = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dropout=dropout, batch_first=True)
+        self.transformer_1m = nn.TransformerEncoder(encoder_layer_1m, num_layers=num_layers)
 
-        # Transformer 編碼器
-        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dropout=dropout, batch_first=True)
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        # --- 15分鐘線分支 (全局) ---
+        self.conv15m = nn.Conv1d(in_channels=input_dim, out_channels=d_model, kernel_size=3)
+        self.bn15m = nn.BatchNorm1d(d_model)
+        self.pos_embed_15m = nn.Parameter(torch.zeros(1, seq_len_15m, d_model))
+        
+        encoder_layer_15m = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dropout=dropout, batch_first=True)
+        self.transformer_15m = nn.TransformerEncoder(encoder_layer_15m, num_layers=num_layers)
 
-        # 分類頭 (輸出: 7 個類別, -3到3對應0到6)
-        self.fc1 = nn.Linear(d_model, 32)
+        # --- 融合決策層 ---
+        self.fc1 = nn.Linear(d_model * 2, 64)
         self.dropout_fc = nn.Dropout(dropout)
-        self.fc2 = nn.Linear(32, 7)
+        self.fc2 = nn.Linear(64, 7)
 
-    def forward(self, x):
-        # x shape: [batch, seq_len, features]
-        x = x.transpose(1, 2) # [batch, features, seq_len]
+    def forward(self, x_1m, x_15m):
+        """
+        x_1m: [batch, 40, features]
+        x_15m: [batch, 20, features]
+        """
+        # 1. 處理 1分鐘分支 (Left Padding for Causal Convolution)
+        # x_1m.transpose(1, 2) -> [batch, features, 40]
+        # F.pad(..., (2, 0)) -> 在時序維度最左側補兩個 0，使 kernel=3 輸出的長度仍為 40
+        x1 = F.pad(x_1m.transpose(1, 2), (2, 0)) 
+        x1 = F.relu(self.bn1m(self.conv1m(x1))).transpose(1, 2) # [batch, 40, d_model]
+        x1 = x1 + self.pos_embed_1m
+        out1 = self.transformer_1m(x1)[:, -1, :]
 
-        # CNN 萃取
-        x = self.dropout_cnn(F.relu(self.bn1(self.conv1(x))))
+        # 2. 處理 15分鐘分支
+        x15 = F.pad(x_15m.transpose(1, 2), (2, 0))
+        x15 = F.relu(self.bn15m(self.conv15m(x15))).transpose(1, 2) # [batch, 20, d_model]
+        x15 = x15 + self.pos_embed_15m
+        out15 = self.transformer_15m(x15)[:, -1, :]
 
-        # 轉回 Transformer 輸入格式: [batch, seq_len, d_model]
-        x = x.transpose(1, 2)
-
-        # Transformer 注意力
-        out = self.transformer(x)
-
-        # 取最後一個時間步
-        last_out = out[:, -1, :]
-
-        # 全連接預測
-        y = self.dropout_fc(F.relu(self.fc1(last_out)))
+        # 3. 特徵拼接與最終決策
+        combined = torch.cat([out1, out15], dim=-1)
+        y = self.dropout_fc(F.relu(self.fc1(combined)))
         logits = self.fc2(y)
 
         return logits

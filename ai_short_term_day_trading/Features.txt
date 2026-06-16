@@ -1,0 +1,63 @@
+總共使用了 51 個特徵 (Features) 進行訓練。這些特徵可以分為以下 8 大類別：
+
+  1. 價格動能與報酬率類 (Price Momentum & Returns) - 5 個
+  這類特徵捕捉價格的變化速度與方向：
+   * ret: 每一分鐘的報酬率。
+   * intraday_trend: 目前價格相對於當日開盤的漲跌幅。
+   * gap_amplitude: 開盤跳空缺口的幅度。
+   * price_roc: 價格變動率 (Rate of Change)。
+   * close_frac_diff: 分數階差分 (Fractional Difference)，用於保留價格的長期記憶性同時維持數據平穩。
+
+  2. 技術指標類 (Technical Indicators) - 8 個
+  傳統的量化分析指標：
+   * macd, signal, macd_hist: 指數平滑異同移動平均線及其柱狀圖。
+   * rsi, rsi_fast: 強弱指標（包含快、慢兩種週期，偵測超買/超賣）。
+   * ma_20: 20 均線（雖然 Close 被排除，但其均線斜率與乖離率被保留）。
+   * dist_from_ma20: 價格相對於 20 均線的乖離率。
+   * spot_futures_proxy: 期現貨強弱代理指標。
+
+  3. 波動率與通道類 (Volatility & Bands) - 6 個
+  衡量市場恐慌程度與區間擠壓：
+   * atr: 平均真實波幅 (衡量絕對波動量)。
+   * bb_width: 布林通道寬度。
+   * is_squeeze: 是否處於通道擠壓狀態 (判斷即將噴發)。
+   * pullback_from_high: 自區間高點回檔的深度。
+   * bounce_from_low: 自區間低點彈升的幅度。
+   * noise_wavelet: 利用小波轉換分離出的市場雜訊項。
+
+  4. 價量結構類 (Volume & Liquidity) - 4 個
+  分析成交量與價格的配合關係：
+   * vwap_bias: 價格相對於成交量加權平均價 (VWAP) 的偏離。
+   * vol_surge_ratio: 成交量爆量倍數 (相對於過去 20 根均量)。
+   * pv_divergence: 價量背離偵測 (價漲量縮或價跌量縮)。
+   * slope_vwap: VWAP 的斜率 (衡量資金推進速度)。
+
+  5. K 線型態特徵 (K-Line Structure) - 5 個
+  針對單根 K 棒的微觀型態分析：
+   * body_length: K 線實體長度。
+   * upper_shadow, lower_shadow: 上下影線長度。
+   * body_avg_5: 過去 5 根 K 棒的平均實體長度。
+   * momentum_explosion: 動能爆發訊號 (當前實體顯著大於平均)。
+
+  6. 三大法人籌碼類 (Institutional Chips) - 12 個
+  這是您模型中非常核心的特徵，結合了期交所與證交所數據：
+   * pc_ratio, pc_ratio_momentum: 選擇權 Put/Call Ratio 及其動能。
+   * foreign_net_oi, foreign_net_oi_zscore, foreign_net_oi_momentum: 外資期貨淨未平倉、標準化分數及變動量。
+   * dealer_net_oi, dealer_net_oi_zscore, dealer_net_oi_momentum: 自營商期貨淨未平倉及其衍生指標。
+   * dealer_relative_momentum: 自營商相對於外資的籌碼動能強弱。
+   * dealer_extreme_score: 自營商極端操作分數。
+   * foreign_spot_net, dealer_spot_net: 外資與自營商在現貨市場的買賣超。
+
+  7. 時間與結算因子 (Time & Settlement) - 8 個
+  考慮台指期的特殊結算規則：
+   * dte: 距離結算日剩餘天數 (Days to Expiration)。
+   * settlement_type: 結算類型 (週結算、月結算)。
+   * is_settlement_day: 是否為當日結算。
+   * day_of_week: 星期幾。
+   * gap_filled: 今日缺口是否已回補。
+   * daily_open, yesterday_close: 基準參考價格。
+
+  8. 進階量化與趨勢斜率 (Advanced Quant & Slopes) - 3 個
+   * slope_ma20: 中期趨勢的速度。
+   * trend_wavelet: 利用小波轉換提取出的市場純趨勢項。
+   * vwap_5: 5 分鐘微觀資金趨勢。

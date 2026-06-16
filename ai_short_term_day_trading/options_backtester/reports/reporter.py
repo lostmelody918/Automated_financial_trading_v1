@@ -4,7 +4,7 @@ import os
 from datetime import datetime
 
 class ReportGenerator:
-    def __init__(self, target_date: str, output_dir: str = "reports_output"):
+    def __init__(self, target_date: str, output_dir: str = r"F:\Gemini_CLI_Application\finance_v2\ai_short_term_day_trading\reports_output"):
         self.target_date = target_date
         self.output_dir = output_dir
         os.makedirs(self.output_dir, exist_ok=True)

@@ -30,6 +30,95 @@ class DayTradingDataEngine:
         else:
             raise SystemExit("終止程式：缺少 API 金鑰。")
 
+    def build_settlement_calendar(self):
+        """
+        建立動態交割日曆：向歷史回推固定的結算規則，並向未來讀取 API 中的 delivery_date
+        回傳: dict, key=date_str (YYYY-MM-DD), value={'type': int}
+        type: 1 (一般週結算/週五特殊結算), 2 (期貨月結算)
+        """
+        import calendar
+        from datetime import datetime, timedelta
+        
+        settlement_calendar = {}
+        today = datetime.now().date()
+        
+        # 1. 向歷史回推 3 年
+        for i in range(365 * 3):
+            d = today - timedelta(days=i)
+            if d.weekday() == 2: # 週三
+                # 第三個週三 (15~21號)
+                if 15 <= d.day <= 21:
+                    settlement_calendar[d.strftime('%Y-%m-%d')] = 2 # 月結算
+                else:
+                    settlement_calendar[d.strftime('%Y-%m-%d')] = 1 # 週結算
+        
+        # 2. 向未來讀取 API 中所有的 delivery_date (期貨、周三、周五和假日特殊合約)
+        if hasattr(self, 'api') and self.api:
+            try:
+                for cat in ['TXO', 'TX1', 'TX2', 'TX4', 'TX5', 'TXU', 'TXV', 'TXX']:
+                    if hasattr(self.api.Contracts.Options, cat):
+                        for c in getattr(self.api.Contracts.Options, cat):
+                            if hasattr(c, 'delivery_date'):
+                                date_str = c.delivery_date.replace('/', '-')
+                                try:
+                                    d_obj = datetime.strptime(date_str, '%Y-%m-%d').date()
+                                    # 簡單判斷：如果是第三個週三，視為月結算；否則是週/特殊結算
+                                    if d_obj.weekday() == 2 and 15 <= d_obj.day <= 21:
+                                        s_type = 2
+                                    else:
+                                        s_type = 1
+                                    settlement_calendar[date_str] = s_type
+                                except:
+                                    pass
+            except Exception as e:
+                print(f"⚠️ 讀取未來 API 結算日失敗: {e}")
+                
+        return settlement_calendar
+
+    def add_expiration_features(self, df, settlement_calendar=None):
+        """
+        將交割日資訊注入 DataFrame，建立時間感知特徵
+        """
+        if df.empty: return df
+        if settlement_calendar is None:
+            settlement_calendar = self.build_settlement_calendar()
+            
+        df['settlement_type'] = 0
+        df['is_settlement_day'] = 0
+        df['dte'] = 5.0
+        
+        # 建立日期索引以加速計算
+        df_dates = df['date_only'].unique()
+        
+        for d in df_dates:
+            d_str = d.strftime('%Y-%m-%d')
+            
+            # 尋找下一個結算日與距離天數 (DTE)
+            future_dte = 5.0
+            found_type = 0
+            # 從當天往後找 15 天以內的結算日
+            for i in range(15):
+                future_d = d + pd.Timedelta(days=i)
+                f_str = future_d.strftime('%Y-%m-%d')
+                if f_str in settlement_calendar:
+                    future_dte = float(i)
+                    found_type = settlement_calendar[f_str]
+                    break
+            
+            mask = df['date_only'] == d
+            df.loc[mask, 'settlement_type'] = found_type
+            df.loc[mask, 'is_settlement_day'] = 1 if future_dte == 0.0 else 0
+            
+            # 精確到秒的 DTE 計算：結算日中午 13:30 剩餘天數
+            # 若為今天結算，則計算 13:30 減去當前 K 線時間
+            # 若為未來結算，則為 future_dte + 當天剩餘時間 (以 13:30 為基準)
+            target_time = pd.to_datetime(d_str + ' 13:30:00')
+            time_diff_days = (target_time - df.loc[mask, 'date']).dt.total_seconds() / 86400.0
+            
+            df.loc[mask, 'dte'] = (future_dte + time_diff_days).clip(lower=0.001)
+            
+        return df
+
     def fetch_intraday_data(self, days=60):
         """
         強制日期對齊與高維度特徵提取引擎
@@ -66,6 +155,14 @@ class DayTradingDataEngine:
             df['ts'] = pd.to_datetime(df['ts'])
             df = df.sort_values('ts').reset_index(drop=True) # 強制時間排序
             df.rename(columns={'ts': 'date'}, inplace=True)
+            
+            # 確保欄位名稱正確 (Shioaji kbars 通常是小寫，但此程式碼預期大寫)
+            rename_map = {
+                'open': 'Open', 'high': 'High', 'low': 'Low', 
+                'close': 'Close', 'volume': 'Volume', 'amount': 'Amount'
+            }
+            df.rename(columns=rename_map, inplace=True)
+
             # 檢查列名是否已經改了
             if 'date' not in df.columns:
                 print(f"DEBUG: 重新命名失敗，目前的欄位: {df.columns.tolist()}")
@@ -187,11 +284,38 @@ class DayTradingDataEngine:
             df['pv_divergence'] = np.where((df['price_roc'] > 0) & (df['vol_surge_ratio'] < 0.8), -1,
                                 np.where((df['price_roc'] < 0) & (df['vol_surge_ratio'] < 0.8), 1, 0))
 
+            # ==========================================
+            # 🔬 進階數學特徵工程 (Quant Tools)
+            # ==========================================
+            # 1. 分數階差分 (Fractional Differencing) - 保留長記憶性
+            d = 0.4
+            w = [1.]
+            for k in range(1, 100):
+                w_ = -w[-1] / k * (d - k + 1)
+                if abs(w_) < 1e-4: break
+                w.append(w_)
+            w = np.array(w[::-1])
+            res = np.convolve(df['Close'].ffill().values, w, mode='full')[:len(df)]
+            res[:len(w)] = 0
+            df['close_frac_diff'] = res
+
+            # 2. 小波轉換 (Wavelet Transform) - Causal Haar Approximation 分離趨勢與雜訊
+            arr = df['Close'].ffill().values
+            trend = np.zeros_like(arr)
+            noise = np.zeros_like(arr)
+            trend[1:] = (arr[1:] + arr[:-1]) / 1.41421356
+            noise[1:] = (arr[1:] - arr[:-1]) / 1.41421356
+            trend[0] = arr[0] * 1.41421356
+            df['trend_wavelet'] = trend
+            df['noise_wavelet'] = noise
 
             # 5. 清理與輸出
             # 刪除輔助計算的欄位，保留乾淨的 DataFrame
             cols_to_drop = ['vol_price', 'cum_vol_price', 'cum_vol', 'h_l', 'h_pc', 'l_pc', 'tr', 'sma20', 'std20', 'Amount']
             df.drop(columns=[c for c in cols_to_drop if c in df.columns], inplace=True)
+
+            # 注入交割日時間特徵
+            df = self.add_expiration_features(df)
 
             print(f"✅ 數據更新完成。最新時間: {df['date'].iloc[-1]}, 總筆數: {len(df)}")
             return df.dropna().reset_index(drop=True)
@@ -553,10 +677,6 @@ class DayTradingDataEngine:
 
         print(f"✅ 籌碼融合完成，最終資料筆數: {len(df_merged)}")
         # 輸出一下目前的空值檢查報告
-        null_count = df_merged.isnull().sum().sum()
-        print(f"ℹ️ 最終檢查：融合後資料集尚有 {null_count} 個空值 (正常情況應為 0)")
-
-        return df_merged.reset_index(drop=True)    # 輸出一下目前的空值檢查報告
         null_count = df_merged.isnull().sum().sum()
         print(f"ℹ️ 最終檢查：融合後資料集尚有 {null_count} 個空值 (正常情況應為 0)")
 

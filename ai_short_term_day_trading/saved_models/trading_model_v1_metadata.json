@@ -1,15 +1,21 @@
 {
     "experiment_info": {
-        "version": "v1",
-        "date": "2026-04-30 10:42:55",
-        "model_class": "CompositeDayTradingAI"
+        "version": "v235",
+        "date": "2026-06-17 00:42:49",
+        "model_class": "MultiTimeframeCompositeAI"
     },
     "hyperparameters": {
-        "window_size": 40,
-        "input_dim": 32,
-        "epochs": 100
+        "config": {
+            "lr": 0.0003,
+            "d_model": 256,
+            "nhead": 8,
+            "num_layers": 3,
+            "weight_decay": 0.01,
+            "batch_size": 2048,
+            "epochs": 150
+        }
     },
     "performance": {
-        "loss": 0.00490087359549951
+        "loss": 0.44110208644462556
     }
 }

@@ -91,7 +91,7 @@
    1 python
      ai_short_term_day_trading/options_backtester/reports/reporter.py
   執行後，請到
-  ai_short_term_day_trading/options_backtester/reports_output/
+  ai_short_term_day_trading/reports_output/
   目錄下，您會看到生成的 .md 報告與 .json 檔。
 
   (可選進階) 步驟 4：編譯 C++ 極速引擎
