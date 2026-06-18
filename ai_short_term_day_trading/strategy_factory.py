@@ -13,11 +13,19 @@ class CompositeOptionsStrategy:
     def generate_signal(self, df_slice, ai_score=None, last_win=False):
         if ai_score is None or len(ai_score) != 7: return 0
 
+        # 若已經是機率分佈 (總和約為 1.0)，則跳過 Softmax，避免過度扁平化 (Squashing)
+        if np.isclose(np.sum(ai_score), 1.0):
+            probs = np.array(ai_score)
+        else:
+            # 將原始分數 (Logits) 轉換為機率 (Softmax) 以避免高於 1 的信心值
+            exp_scores = np.exp(ai_score - np.max(ai_score))
+            probs = exp_scores / exp_scores.sum()
+
         # 計算 AI 信心水準 (機率最高的一項)
-        ai_confidence = np.max(ai_score)
+        ai_confidence = np.max(probs)
 
         # AI 基礎訊號轉換 (-3 到 3)
-        pred_class = np.argmax(ai_score)
+        pred_class = np.argmax(probs)
         mapping = {0: -3, 1: -2, 2: -1, 3: 0, 4: 1, 5: 2, 6: 3}
         base_signal = mapping.get(pred_class, 0)
 
@@ -41,6 +49,23 @@ class CompositeOptionsStrategy:
         rsi_fast = last_row.get('rsi_fast', 50.0)
         vol_surge = last_row.get('vol_surge_ratio', 1.0)
         momentum_explosion = last_row.get('momentum_explosion', 0)
+
+        # 新增美股與日股特徵
+        us_tw_gap_divergence = last_row.get('us_tw_gap_divergence', 0.0)
+        nikkei_premarket_momentum = last_row.get('nikkei_premarket_momentum', 0.0)
+
+        minutes_of_day = 0
+        if 'time' in last_row:
+            current_time = last_row['time']
+            minutes_of_day = current_time.hour * 60 + current_time.minute
+
+        date_str = ""
+        if 'date_only' in last_row:
+            date_str = last_row['date_only'].strftime('%Y-%m-%d') if hasattr(last_row['date_only'], 'strftime') else str(last_row['date_only'])
+        
+        # 簡化版 FOMC 日期
+        fomc_dates = ['2026-01-28', '2026-03-18', '2026-04-29', '2026-06-17', '2026-07-29', '2026-09-16', '2026-11-04', '2026-12-16']
+        is_fomc_day = date_str in fomc_dates
 
         # 結算與時間特徵
         settlement_type = last_row.get('settlement_type', 0)
@@ -81,6 +106,12 @@ class CompositeOptionsStrategy:
         # 🛡️ 第一層：絕對防禦網 (Safety Nets)
         # ==================================================
         if base_signal != 0:
+            # 0. FOMC 日防護 (波動率風險控制)
+            if is_fomc_day:
+                if vol_surge < 2.0 or abs(slope_ma20) < 2.0:
+                    print(f"🛡️ [FOMC保護] 利率決策日震盪劇烈，動能不足 (Vol={vol_surge:.2f}) 沒收訊號。")
+                    base_signal = 0
+
             # 1. 結算日防護 (Gamma/Theta 雙刃劍)
             if is_settlement_day:
                 if settlement_type == 2: # 期貨月大結算

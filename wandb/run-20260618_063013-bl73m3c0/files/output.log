@@ -1,0 +1,35 @@
+💻 使用設備: cuda
+🔍 特徵欄位數量: 53
+📊 準備多時間尺度 (MTF) 張量與驗證集劃分...
+⚡ 正在執行時序索引優化...
+🛠️ 正在合成時序張量 (這可能需要一點時間)...
+   ⌛ 已完成 0%
+   ⌛ 已完成 10%
+   ⌛ 已完成 20%
+   ⌛ 已完成 30%
+   ⌛ 已完成 40%
+   ⌛ 已完成 50%
+   ⌛ 已完成 60%
+   ⌛ 已完成 70%
+   ⌛ 已完成 80%
+   ⌛ 已完成 90%
+✅ 數據就緒: Train=11570, Val=2893
+🚀 開始訓練...
+🔥 Epoch [10/250], Train Loss: 0.000152, Val Loss: 0.000318
+🔥 Epoch [20/250], Train Loss: 0.000147, Val Loss: 0.000212
+🔥 Epoch [30/250], Train Loss: 0.000082, Val Loss: 0.002041
+🔥 Epoch [40/250], Train Loss: 0.000142, Val Loss: 0.000225
+🔥 Epoch [50/250], Train Loss: 0.000117, Val Loss: 0.000522
+🔥 Epoch [60/250], Train Loss: 0.000078, Val Loss: 0.002803
+🔥 Epoch [70/250], Train Loss: 0.000055, Val Loss: 0.003996
+🔥 Epoch [80/250], Train Loss: 0.000189, Val Loss: 0.000214
+🔥 Epoch [90/250], Train Loss: 0.000187, Val Loss: 0.000209
+🔥 Epoch [100/250], Train Loss: 0.000187, Val Loss: 0.000210
+🔥 Epoch [110/250], Train Loss: 0.000187, Val Loss: 0.000209
+🔥 Epoch [120/250], Train Loss: 0.000185, Val Loss: 0.000208
+🔥 Epoch [130/250], Train Loss: 0.000184, Val Loss: 0.000209
+🔥 Epoch [140/250], Train Loss: 0.000188, Val Loss: 0.000209
+🛑 Early Stopping at Epoch 142
+💾 儲存最佳模型 (Val Loss: 0.000207)...
+❌ [ModelManager] 儲存失敗: Object of type method is not JSON serializable
+✅ 訓練完成！

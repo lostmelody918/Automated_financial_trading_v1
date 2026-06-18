@@ -359,19 +359,23 @@ def calculate_features(df_raw, settlement_calendar=None):
 
 def run_live_simulator():
     print("=" * 60 + "\n🚀 啟動：底層期貨特徵分離版 AI 選擇權即時模擬機 (Event-Driven)\n" + "=" * 60)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     engine = DayTradingDataEngine()
 
     with open(os.path.join(os.path.dirname(__file__), "saved_models", "norm_params.json"), 'r', encoding='utf-8') as f:
         norm_params = json.load(f)
 
     feature_cols = [c for c in norm_params['feature_cols'] if c in norm_params['mean']]
-    mean_v = np.array([norm_params['mean'][c] for c in feature_cols])
-    std_v = np.array([norm_params['std'][c] for c in feature_cols])
+    # [Task 1.2] 使用與訓練一致的 median/iqr (json 中存為 mean/std)
+    median_v = np.array([norm_params['mean'][c] for c in feature_cols])
+    iqr_v = np.array([norm_params['std'][c] for c in feature_cols])
 
-    ai_model = CompositeDayTradingAI(input_dim=len(feature_cols), d_model=256, nhead=16, num_layers=4)
+    # [Task 1.3] 確保模型類名與參數與最新訓練腳本一致
+    ai_model = MultiTimeframeCompositeAI(input_dim=len(feature_cols), d_model=256, nhead=8, num_layers=3)
     model_manager = TradingModelManager(model_dir=os.path.join(os.path.dirname(__file__), "saved_models"))
     ai_model, _, version = model_manager.load_latest_model(ai_model)
-    ai_model.eval()
+    ai_model.to(device)
+    ai_model.eval() # 封印計算圖與 BatchNorm/Dropout 固定
 
     strategy_engine = StrategyFactory.get_strategy("composite")
 
@@ -428,7 +432,7 @@ def run_live_simulator():
     last_trade_pnl = 0.0
     trade_log = []
     eod_report_done = False
-    
+
     # --- Recovery Logic (防止重開導致當日已平倉資料與損益遺失) ---
     try:
         from post_market_export import PostMarketExporter
@@ -447,7 +451,7 @@ def run_live_simulator():
                 print(f"🔄 成功從歷史紀錄還原 {len(trade_log)} 筆今日交易。還原後最新本金: NT$ {current_capital:,.0f}")
     except Exception as e:
         print(f"⚠️ 還原今日交易紀錄失敗: {e}")
-        
+
     entry_features = {}
 
     df_chips_daily = load_latest_daily_chips_snapshot()
@@ -592,13 +596,13 @@ def run_live_simulator():
 
         # 每 30 分鐘定期匯出 (例如 HH:00 或 HH:30 附近，或超過 30 分鐘未匯出)
         if (current_time - last_export_time).total_seconds() >= 1800 or (is_eod_closing_time(now, is_settlement=is_today_settlement) and pos_manager.get('position') == 0 and not eod_report_done):
-            
+
             is_eod = is_eod_closing_time(now, is_settlement=is_today_settlement)
-            
+
             if is_eod and pos_manager.get('position') == 0 and not eod_report_done:
                 generate_eod_report(trade_log, INITIAL_CAPITAL, current_capital)
                 eod_report_done = True
-                
+
             # --- 匯出盤後/定期資料與視覺化報表 ---
             try:
                 from post_market_export import PostMarketExporter
@@ -643,7 +647,11 @@ def run_live_simulator():
                     new_row = pd.DataFrame([bar])
                     df_raw = pd.concat([df_raw, new_row], ignore_index=True)
 
-                    df_intraday = calculate_features(df_raw, settlement_calendar=settlement_calendar)
+                    # [Task 1.1] 阻絕「正在跳動中」的當下分鐘 K 線污染
+                    current_min = datetime.now().replace(second=0, microsecond=0)
+                    df_completed = df_raw[df_raw['date'] < current_min].copy()
+
+                    df_intraday = calculate_features(df_completed, settlement_calendar=settlement_calendar)
                     if df_intraday is None or df_intraday.empty:
                         continue
 
@@ -656,83 +664,90 @@ def run_live_simulator():
                         if missing_col not in df.columns:
                             df[missing_col] = 0.0
 
-                    df_slice = df[feature_cols].tail(WINDOW_SIZE).copy()
-                    for col in ['mock_volume', 'macd_hist', 'vwap_bias']:
-                        if col in df_slice.columns:
-                            df_slice[col] = np.sign(df_slice[col]) * np.log1p(np.abs(df_slice[col]))
+                    # --- Multi-Timeframe (MTF) 預測準備與 [Task 1.2] 正規化 ---
+                    # 1. 1分鐘分支 (40 根)
+                    df_slice_1m = df[feature_cols].tail(40).copy()
+                    x_1m = torch.tensor(np.nan_to_num((df_slice_1m.values - median_v) / np.where(iqr_v == 0, 1.0, iqr_v), nan=0.0), dtype=torch.float32).unsqueeze(0).to(device)
 
-                    feat_tensor = torch.tensor(np.nan_to_num((df_slice.values - mean_v) / np.where(std_v == 0, 1.0, std_v), nan=0.0), dtype=torch.float32).unsqueeze(0)
+                    # 2. 15分鐘分支 (20 根)
+                    df_15m_base = df.set_index('date').resample('15min', closed='right', label='right').last().dropna()
+                    df_slice_15m = df_15m_base[feature_cols].tail(20).copy()
 
-                    with torch.no_grad():
-                        probs = torch.softmax(ai_model(feat_tensor), dim=1).squeeze().cpu().numpy()
+                    if len(df_slice_15m) >= 20:
+                        x_15m = torch.tensor(np.nan_to_num((df_slice_15m.values - median_v) / np.where(iqr_v == 0, 1.0, iqr_v), nan=0.0), dtype=torch.float32).unsqueeze(0).to(device)
 
-                    # --- DEBUG AI ---
-                    max_idx = int(np.argmax(probs))
-                    confidence = probs[max_idx]
-                    class_names = {
-                        0: "Strong Down (-3)", 1: "Med Down (-2)", 2: "Weak Down (-1)",
-                        3: "Hold (0)",
-                        4: "Weak Up (1)", 5: "Med Up (2)", 6: "Strong Up (3)"
-                    }
-                    class_name = class_names.get(max_idx, "Unknown")
+                        # [Task 1.3] 封印 PyTorch 計算圖， evaluation 模式
+                        with torch.no_grad():
+                            ai_model.eval()
+                            probs = torch.softmax(ai_model(x_1m, x_15m), dim=1).squeeze().cpu().numpy()
 
-                    pos = pos_manager.get('position')
-                    if pos != 0:
-                        sym = pos_manager.get('active_contract_symbol')
-                        ep = pos_manager.get('entry_price')
-                        hp = pos_manager.get('highest_price_since_entry')
-                        sl = pos_manager.get('hard_sl_price')
-                        tp = pos_manager.get('hard_tp_price')
+                        # --- DEBUG AI ---
+                        max_idx = int(np.argmax(probs))
+                        confidence = probs[max_idx]
+                        class_names = {
+                            0: "Strong Down (-3)", 1: "Med Down (-2)", 2: "Weak Down (-1)",
+                            3: "Hold (0)",
+                            4: "Weak Up (1)", 5: "Med Up (2)", 6: "Strong Up (3)"
+                        }
+                        class_name = class_names.get(max_idx, "Unknown")
 
-                        quote_data = opt_quotes.get(current_active_code, {}) if current_active_code else {}
-                        current_opt_price = quote_data.get('price', 0)
-                        if not current_opt_price or current_opt_price <= 0:
-                            bid = quote_data.get('bid', 0)
-                            ask = quote_data.get('ask', 0)
-                            if bid > 0 and ask > 0:
-                                current_opt_price = round((bid + ask) / 2, 1)
-                            else:
-                                current_opt_price = 'N/A'
+                        pos = pos_manager.get('position')
+                        if pos != 0:
+                            sym = pos_manager.get('active_contract_symbol')
+                            ep = pos_manager.get('entry_price')
+                            hp = pos_manager.get('highest_price_since_entry')
+                            sl = pos_manager.get('hard_sl_price')
+                            tp = pos_manager.get('hard_tp_price')
 
-                        print(f"[{time_str}] 🤖 AI 預測完成: Class={max_idx-3} ({class_name}), Confidence={confidence:.2%} | 📊 持倉: {sym} (現價: {current_opt_price}, 進: {ep}, 高: {hp}, 防: {sl:.1f}, 利: {tp})")
+                            quote_data = opt_quotes.get(current_active_code, {}) if current_active_code else {}
+                            current_opt_price = quote_data.get('price', 0)
+                            if not current_opt_price or current_opt_price <= 0:
+                                bid = quote_data.get('bid', 0)
+                                ask = quote_data.get('ask', 0)
+                                if bid > 0 and ask > 0:
+                                    current_opt_price = round((bid + ask) / 2, 1)
+                                else:
+                                    current_opt_price = 'N/A'
 
-                        # 動態調整持倉的停損停利 (依據最新 AI 預測強度)
-                        ai_pred_val = max_idx - 3
-                        strength = ai_pred_val if pos == 1 else -ai_pred_val
+                            print(f"[{time_str}] 🤖 AI 預測完成: Class={max_idx-3} ({class_name}), Confidence={confidence:.2%} | 📊 持倉: {sym} (現價: {current_opt_price}, 進: {ep}, 高: {hp}, 防: {sl:.1f}, 利: {tp})")
 
-                        new_tp, new_sl = tp, sl
-                        if strength <= 0:
-                            if hp > ep + 10:
-                                new_sl = max(sl, ep + 2)
-                            else:
-                                new_sl = max(sl, ep - (ep - sl)*0.5)
-                            new_tp = ep + 5
-                        elif strength == 1:
-                            if hp > ep + 15:
-                                new_sl = max(sl, ep + 5)
-                            new_tp = tp * 0.9
-                        elif strength == 2:
-                            if hp > ep + 20:
-                                new_sl = max(sl, hp - 10)
-                            new_tp = tp * 0.95
+                            # 動態調整持倉的停損停利 (依據最新 AI 預測強度)
+                            ai_pred_val = max_idx - 3
+                            strength = ai_pred_val if pos == 1 else -ai_pred_val
 
-                        new_tp = max(new_tp, ep + 3)
+                            new_tp, new_sl = tp, sl
+                            if strength <= 0:
+                                if hp > ep + 10:
+                                    new_sl = max(sl, ep + 2)
+                                else:
+                                    new_sl = max(sl, ep - (ep - sl)*0.5)
+                                new_tp = ep + 5
+                            elif strength == 1:
+                                if hp > ep + 15:
+                                    new_sl = max(sl, ep + 5)
+                                new_tp = tp * 0.9
+                            elif strength == 2:
+                                if hp > ep + 20:
+                                    new_sl = max(sl, hp - 10)
+                                new_tp = tp * 0.95
 
-                        if new_tp != tp or new_sl != sl:
-                            pos_manager.update(hard_tp_price=new_tp, hard_sl_price=new_sl)
-                            print(f"[{time_str}] ⚠️ AI 預測強度變動 (目前強度: {strength})，動態調整停利為 {new_tp:.1f}，停損收緊至 {new_sl:.1f}")
+                            new_tp = max(new_tp, ep + 3)
 
-                    else:
-                        print(f"[{time_str}] 🤖 AI 預測完成: Class={max_idx-3} ({class_name}), Confidence={confidence:.2%}, Probs={np.round(probs, 3)}")
+                            if new_tp != tp or new_sl != sl:
+                                pos_manager.update(hard_tp_price=new_tp, hard_sl_price=new_sl)
+                                print(f"[{time_str}] ⚠️ AI 預測強度變動 (目前強度: {strength})，動態調整停利為 {new_tp:.1f}，停損收緊至 {new_sl:.1f}")
 
-                    # --- Entry Logic ---
-                    if pos_manager.get('position') == 0 and is_market_open(now.time()) and not is_eod_closing_time(now, is_settlement=is_today_settlement):
-                        if cooldown_until and now < cooldown_until:
-                            continue
-                        elif cooldown_until and now >= cooldown_until:
-                            cooldown_until = None
-                            consecutive_total_losses = 0
-                            print(f"[{time_str}] 🟢 冷卻時間結束，恢復交易！")
+                        else:
+                            print(f"[{time_str}] 🤖 AI 預測完成: Class={max_idx-3} ({class_name}), Confidence={confidence:.2%}, Probs={np.round(probs, 3)}")
+
+                        # --- Entry Logic ---
+                        if pos_manager.get('position') == 0 and is_market_open(now.time()) and not is_eod_closing_time(now, is_settlement=is_today_settlement):
+                            if cooldown_until and now < cooldown_until:
+                                continue
+                            elif cooldown_until and now >= cooldown_until:
+                                cooldown_until = None
+                                consecutive_total_losses = 0
+                                print(f"[{time_str}] 🟢 冷卻時間結束，恢復交易！")
 
                         signal = strategy_engine.generate_signal(df, ai_score=probs, last_win=last_trade_win)
 

@@ -59,7 +59,9 @@ class TradingModelManager:
         latest_file = max(files, key=os.path.getctime)
         print(f"📦 [ModelManager] 發現最新模型，準備載入：{latest_file}")
 
-        checkpoint = torch.load(latest_file)
+        # 自動適應當前機器的硬體環境 (GPU -> CPU 轉向防護)
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        checkpoint = torch.load(latest_file, map_location=device)
         model.load_state_dict(checkpoint['model_state_dict'])
 
         if optimizer and 'optimizer_state_dict' in checkpoint:

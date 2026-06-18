@@ -1,0 +1,11 @@
+📊 準備多時間尺度 (MTF) 張量與驗證集劃分...
+✅ 數據就緒: Train=462379, Val=115595
+🚀 開始訓練 (含因果卷積與驗證集)...
+🔥 Epoch [10/180], Train Loss: 0.832953, Val Loss: 0.876089 | LR: 0.00030000
+🔥 Epoch [20/180], Train Loss: 0.827747, Val Loss: 0.851983 | LR: 0.00015050
+🛑 觸發 Early Stopping 於 Epoch 28
+💾 訓練結束，正在儲存驗證集表現最佳模型 (Val Loss: 0.835655)...
+✅ [ModelManager] 成功儲存版本 v2
+   - 模型檔: f:\Gemini_CLI_Application\finance_v2\ai_short_term_day_trading\saved_models\trading_model_v2.pth
+   - 紀錄檔: f:\Gemini_CLI_Application\finance_v2\ai_short_term_day_trading\saved_models\trading_model_v2_metadata.json
+✅ 訓練任務完成！

@@ -1,0 +1,21 @@
+{
+    "experiment_info": {
+        "version": "v5",
+        "date": "2026-06-18 06:39:46",
+        "model_class": "MultiTimeframeCompositeAI"
+    },
+    "hyperparameters": {
+        "config": {
+            "lr": 0.0005,
+            "d_model": 256,
+            "nhead": 8,
+            "num_layers": 3,
+            "weight_decay": 0.01,
+            "batch_size": 512,
+            "epochs": 250
+        }
+    },
+    "performance": {
+        "val_loss": 0.000207630597287789
+    }
+}

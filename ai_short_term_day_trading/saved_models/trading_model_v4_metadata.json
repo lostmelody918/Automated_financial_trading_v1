@@ -1,0 +1,43 @@
+{
+    "experiment_info": {
+        "version": "v4",
+        "date": "2026-06-18 06:32:23",
+        "model_class": "MultiTimeframeCompositeAI"
+    },
+    "hyperparameters": {
+        "config": {
+            "_items": {
+                "_wandb": {
+                    "m": [],
+                    "cli_version": "0.27.2",
+                    "python_version": "3.13.1",
+                    "t": {
+                        "4": "3.13.1",
+                        "5": "0.27.2",
+                        "8": [
+                            3
+                        ],
+                        "12": "0.27.2",
+                        "13": "windows-amd64",
+                        "1": [
+                            1,
+                            105
+                        ],
+                        "3": [
+                            16
+                        ]
+                    }
+                },
+                "lr": 0.0005,
+                "d_model": 256,
+                "nhead": 8,
+                "num_layers": 3,
+                "weight_decay": 0.01,
+                "batch_size": 512,
+                "epochs": 250
+            },
+            "_locked": {},
+            "_users": {},
+            "_users_inv": {},
+            "_users_cnt": 0,
+            "_callback": 

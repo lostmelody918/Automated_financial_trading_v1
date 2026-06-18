@@ -32,7 +32,8 @@ class PostMarketExporter:
             # 確保嚴格的時間序列排序 (Strict Time Sequence)
             df_clean[time_col] = pd.to_datetime(df_clean[time_col], errors='coerce')
             df_clean = df_clean.dropna(subset=[time_col]) # Drop invalid times
-            df_clean[time_col] = df_clean[time_col].dt.tz_localize(None) # 確保時區中立 (Timezone Naive)
+            if df_clean[time_col].dt.tz is not None:
+                df_clean[time_col] = df_clean[time_col].dt.tz_localize(None) # 確保時區中立 (Timezone Naive)
             df_clean = df_clean.sort_values(time_col).reset_index(drop=True)
         
         # 處理數值 NaN

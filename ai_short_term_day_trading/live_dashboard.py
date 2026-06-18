@@ -700,10 +700,10 @@ else:
                                 sys.path.append(curr_dir)
 
                             try:
-                                from composite_ai import CompositeDayTradingAI
+                                from composite_ai import MultiTimeframeCompositeAI
                             except ImportError:
                                 sys.path.append("F:/Gemini_CLI_Application/finance_v2/ai_short_term_day_trading")
-                                from composite_ai import CompositeDayTradingAI
+                                from composite_ai import MultiTimeframeCompositeAI
 
                             with st.spinner(f"正在執行 {target_dir} SHAP 分析..."):
                                 dir_series = df_hist['direction'].fillna('').str.lower()
@@ -752,7 +752,7 @@ else:
                                                         nhead = hp.get('nhead', 16)
                                                         num_layers = hp.get('num_layers', 4)
 
-                                            ai_model = CompositeDayTradingAI(input_dim=len(feature_cols), d_model=d_model, nhead=nhead, num_layers=num_layers)
+                                            ai_model = MultiTimeframeCompositeAI(input_dim=len(feature_cols), d_model=d_model, nhead=nhead, num_layers=num_layers)
                                             checkpoint = torch.load(latest_model_path, map_location='cpu', weights_only=True)
                                             ai_model.load_state_dict(checkpoint['model_state_dict'])
                                             ai_model.eval()
@@ -770,7 +770,16 @@ else:
                                             X_tensor = torch.tensor(X_list, dtype=torch.float32)
                                             background = torch.zeros((1, window_size, len(feature_cols)), dtype=torch.float32)
 
-                                            explainer = shap.GradientExplainer(ai_model, background)
+                                            class SHAPWrapper(torch.nn.Module):
+                                                def __init__(self, model):
+                                                    super().__init__()
+                                                    self.model = model
+                                                def forward(self, x_1m):
+                                                    x_15m = torch.zeros((x_1m.size(0), 20, x_1m.size(2)), device=x_1m.device, dtype=x_1m.dtype)
+                                                    return self.model(x_1m, x_15m)
+
+                                            wrapped_model = SHAPWrapper(ai_model)
+                                            explainer = shap.GradientExplainer(wrapped_model, background)
                                             shap_values = explainer.shap_values(X_tensor)
 
                                             if isinstance(shap_values, list):

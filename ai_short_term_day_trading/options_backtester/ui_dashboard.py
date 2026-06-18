@@ -27,7 +27,7 @@ from database.timescale_client import TimescaleDBClient
 # Import AI modules
 try:
     from data_engine import DayTradingDataEngine
-    from composite_ai import CompositeDayTradingAI
+    from composite_ai import MultiTimeframeCompositeAI
     from model_manager import TradingModelManager
     from strategy_factory import StrategyFactory
     from delta_gamma_theta import get_dynamic_bsm_bounds, calculate_bs_greeks

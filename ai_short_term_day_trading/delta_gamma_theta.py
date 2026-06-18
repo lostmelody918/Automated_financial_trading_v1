@@ -16,6 +16,15 @@ def get_api_based_dte(active_contract, current_time):
         # 2. 統一格式化 (消除斜線，統一變為 YYYYMMDD)
         clean_date_str = delivery_date_str.replace('/', '')
 
+        if len(clean_date_str) == 6:
+            import calendar
+            year = int(clean_date_str[:4])
+            month = int(clean_date_str[4:])
+            c = calendar.monthcalendar(year, month)
+            wednesdays = [week[calendar.WEDNESDAY] for week in c if week[calendar.WEDNESDAY] != 0]
+            third_wed_day = wednesdays[2] if len(wednesdays) > 2 else wednesdays[-1]
+            clean_date_str = f"{year:04d}{month:02d}{third_wed_day:02d}"
+
         # 3. 綁定台指期/選擇權的法定結算時間 (13:30:00)
         settlement_time = datetime.strptime(f"{clean_date_str} 13:30:00", "%Y%m%d %H:%M:%S")
 
@@ -23,8 +32,13 @@ def get_api_based_dte(active_contract, current_time):
         delta = settlement_time - current_time
         dte_days = delta.total_seconds() / 86400.0
 
-        # 5. 防禦機制：如果已經超過結算時間，給予極小值避免 BSM 分母除以 0
-        return max(dte_days, 0.001)
+        # 5. 防禦機制：如果已經超過結算時間，給予極小值
+        dte_days = max(dte_days, 0.001)
+
+        # 🚀 BSM 方程式的 T 必須為年，強制年化
+        dte_years = dte_days / 365.0
+
+        return dte_years
 
     except Exception as e:
         print(f"⚠️ 解析 API 交割日失敗 ({e})，啟動降級防禦 (預設 1 天)")
@@ -66,7 +80,7 @@ def get_dynamic_bsm_bounds(S, K, T, r, iv, atr, tp_mult, sl_mult, expected_hold_
     fee_points: 來回手續費與滑價所折合的點數，將墊高停利目標並收緊停損防線
     """
     delta, gamma, theta, theoretical_price = calculate_bs_greeks(S, K, T, r, iv, option_type)
-    
+
     # 若有提供實際進場價，則以實際進場價為基準，否則使用理論價
     base_price = actual_entry_price if actual_entry_price is not None else theoretical_price
 
@@ -77,7 +91,7 @@ def get_dynamic_bsm_bounds(S, K, T, r, iv, atr, tp_mult, sl_mult, expected_hold_
     # 轉化持有時間為天數單位，計算預期 Theta 衰減
     dt_days = expected_hold_hours / 24.0
     raw_theta_decay = theta * dt_days
-    
+
     # 防止末日選擇權的瞬間 Theta 過大導致預估衰減超出實際時間價值
     # 限制最大衰減不超過當前時間價值的 80%
     theta_decay = -min(abs(raw_theta_decay), extrinsic_value * 0.8)
@@ -85,14 +99,14 @@ def get_dynamic_bsm_bounds(S, K, T, r, iv, atr, tp_mult, sl_mult, expected_hold_
     # 1. 停利情境下的標的資產變動 (看對方向)
     delta_S_tp = (atr * tp_mult) if option_type == "Call" else -(atr * tp_mult)
     opt_change_tp = (delta * delta_S_tp) + (0.5 * gamma * (delta_S_tp ** 2)) + theta_decay
-    
+
     # 確保停利點至少高於進場價 (覆蓋手續費)
     # 將手續費成本 fee_points 納入，墊高動態停利點
     hard_tp_price = max(base_price + fee_points + 1.0, base_price + opt_change_tp + fee_points)
 
     # 2. 停損情境下的標的資產變動 (看錯方向)
     delta_S_sl = -(atr * sl_mult) if option_type == "Call" else (atr * sl_mult)
-    
+
     # 修正停損邏輯：我們「不」把時間衰減(負值)加進停損中！
     # 時間流逝造成的虧損也應該被算在停損額度內，因此不該放寬停損線。
     opt_change_sl = (delta * delta_S_sl) + (0.5 * gamma * (delta_S_sl ** 2))
@@ -101,7 +115,7 @@ def get_dynamic_bsm_bounds(S, K, T, r, iv, atr, tp_mult, sl_mult, expected_hold_
 
     # 安全邊界防禦：確保停損價不為負值，且維持最低點位
     hard_sl_price = max(0.5, hard_sl_price)
-    
+
     # 如果算出來的停損太接近進場價 (例如小於 3 點 + 成本)，給予基本的防禦空間
     if (base_price - hard_sl_price) < (3.0 + fee_points):
         hard_sl_price = max(0.5, base_price - (3.0 + fee_points))

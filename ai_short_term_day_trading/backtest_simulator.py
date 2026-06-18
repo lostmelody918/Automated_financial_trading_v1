@@ -10,7 +10,7 @@ plt.rcParams['axes.unicode_minus'] = False # 正常顯示負號
 import torch
 from data_engine import DayTradingDataEngine
 from strategy_factory import StrategyFactory
-from composite_ai import CompositeDayTradingAI
+from composite_ai import MultiTimeframeCompositeAI
 from model_manager import TradingModelManager
 from delta_gamma_theta import calculate_bs_greeks, get_dynamic_bsm_bounds
 
@@ -118,11 +118,12 @@ def run_advanced_simulator(initial_capital=100000, days=5):
         input_dim = len(feature_cols)
 
     # 必須與 train_model.py 的參數一致
-    ai_model = CompositeDayTradingAI(input_dim=input_dim, d_model=256, nhead=16, num_layers=4)
-    optimizer = torch.optim.Adam(ai_model.parameters(), lr=0.001)
+    ai_model = MultiTimeframeCompositeAI(input_dim=input_dim, d_model=256, nhead=8, num_layers=3)
     model_manager = TradingModelManager(model_dir=os.path.join(os.path.dirname(__file__), "saved_models"))
 
-    ai_model, optimizer, current_version = model_manager.load_latest_model(ai_model, optimizer)
+    ai_model, _, current_version = model_manager.load_latest_model(ai_model)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    ai_model.to(device)
     ai_model.eval()
 
     strategy_engine = StrategyFactory.get_strategy("composite")
@@ -173,13 +174,28 @@ def run_advanced_simulator(initial_capital=100000, days=5):
         next_row = df.iloc[i+1]
         curr_time = last_row['date'].time()
 
-        # AI 推理
-        feat_data = curr_slice[norm_params['feature_cols']].tail(WINDOW_SIZE).values
-        feat_normalized = (feat_data - mean_v) / std_v
-        feat_tensor = torch.tensor(feat_normalized, dtype=torch.float32).unsqueeze(0)
-        with torch.no_grad():
-            logits = ai_model(feat_tensor)
-            probs = torch.softmax(logits, dim=1).squeeze().cpu().numpy()
+        # --- Multi-Timeframe (MTF) AI 推理 ---
+        # 1. 1分鐘分支 (40 根)
+        feat_data_1m = curr_slice[norm_params['feature_cols']].tail(40).values
+        feat_normalized_1m = (feat_data_1m - mean_v) / std_v
+        feat_tensor_1m = torch.tensor(feat_normalized_1m, dtype=torch.float32).unsqueeze(0).to(device)
+
+        # 2. 15分鐘分支 (20 根)
+        # 利用現有數據重採樣出 15 分鐘線
+        df_15m_base = curr_slice.set_index('date').resample('15min').last().ffill()
+        feat_data_15m = df_15m_base[norm_params['feature_cols']].tail(20).values
+        
+        # 檢查是否具備足夠的 15m 歷史數據以滿足位置編碼長度 (20)
+        if len(feat_data_15m) < 20:
+            probs = np.zeros(7)
+            probs[3] = 1.0 # 預設中立
+        else:
+            feat_normalized_15m = (feat_data_15m - mean_v) / std_v
+            feat_tensor_15m = torch.tensor(feat_normalized_15m, dtype=torch.float32).unsqueeze(0).to(device)
+
+            with torch.no_grad():
+                logits = ai_model(feat_tensor_1m, feat_tensor_15m)
+                probs = torch.softmax(logits, dim=1).squeeze().cpu().numpy()
 
         # 1. 平倉邏輯
         if position != 0:

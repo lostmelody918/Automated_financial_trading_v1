@@ -25,7 +25,7 @@ from database.timescale_client import TimescaleDBClient
 # Import AI modules
 try:
     from data_engine import DayTradingDataEngine
-    from composite_ai import CompositeDayTradingAI
+    from composite_ai import MultiTimeframeCompositeAI
     from model_manager import TradingModelManager
     from strategy_factory import StrategyFactory
     from delta_gamma_theta import get_dynamic_bsm_bounds, calculate_bs_greeks
@@ -71,7 +71,7 @@ class OptionsSimulator:
             self.mean_v = np.array([self.norm_params['mean'][c] for c in self.feature_cols])
             self.std_v = np.array([self.norm_params['std'][c] for c in self.feature_cols])
         
-            self.ai_model = CompositeDayTradingAI(input_dim=len(self.feature_cols), d_model=256, nhead=16, num_layers=4)
+            self.ai_model = MultiTimeframeCompositeAI(input_dim=len(self.feature_cols), d_model=256, nhead=8, num_layers=3)
             model_manager = TradingModelManager(model_dir=os.path.join(ai_dir, "saved_models"))
             self.ai_model, _, _ = model_manager.load_latest_model(self.ai_model)
             self.ai_model.eval()
@@ -248,10 +248,23 @@ class OptionsSimulator:
                         if col in df_window.columns:
                             df_window[col] = np.sign(df_window[col]) * np.log1p(np.abs(df_window[col]))
 
-                    feat_tensor = torch.tensor(np.nan_to_num((df_window.values - self.mean_v) / np.where(self.std_v == 0, 1.0, self.std_v), nan=0.0), dtype=torch.float32).unsqueeze(0)
+                    # --- Multi-Timeframe (MTF) AI 推理 ---
+                    # 1. 1分鐘分支 (40 根)
+                    feat_tensor_1m = torch.tensor(np.nan_to_num((df_window.values - self.mean_v) / np.where(self.std_v == 0, 1.0, self.std_v), nan=0.0), dtype=torch.float32).unsqueeze(0)
 
-                    with torch.no_grad():
-                        probs = torch.softmax(self.ai_model(feat_tensor), dim=1).squeeze().cpu().numpy()
+                    # 2. 15分鐘分支 (20 根)
+                    # 利用現有數據重採樣出 15 分鐘線
+                    df_15m_base = df_slice.set_index('date').resample('15min').last().ffill()
+                    df_slice_15m = df_15m_base[self.feature_cols].tail(20)
+                    
+                    if len(df_slice_15m) < 20:
+                        probs = np.zeros(7)
+                        probs[3] = 1.0
+                    else:
+                        feat_tensor_15m = torch.tensor(np.nan_to_num((df_slice_15m.values - self.mean_v) / np.where(self.std_v == 0, 1.0, self.std_v), nan=0.0), dtype=torch.float32).unsqueeze(0)
+
+                        with torch.no_grad():
+                            probs = torch.softmax(self.ai_model(feat_tensor_1m, feat_tensor_15m), dim=1).squeeze().cpu().numpy()
                     
                     # Strategy Evaluation
                     signal = self.strategy_engine.generate_signal(df_slice, ai_score=probs, last_win=last_trade_win)

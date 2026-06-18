@@ -1,0 +1,37 @@
+💻 使用設備: cuda
+🔍 特徵欄位數量: 53
+📊 準備多時間尺度 (MTF) 張量與驗證集劃分...
+⚡ 正在執行時序索引優化...
+🛠️ 正在合成時序張量 (這可能需要一點時間)...
+   ⌛ 已完成 0%
+   ⌛ 已完成 10%
+   ⌛ 已完成 20%
+   ⌛ 已完成 30%
+   ⌛ 已完成 40%
+   ⌛ 已完成 50%
+   ⌛ 已完成 60%
+   ⌛ 已完成 70%
+   ⌛ 已完成 80%
+   ⌛ 已完成 90%
+✅ 數據就緒: Train=11570, Val=2893
+🚀 開始訓練...
+🔥 Epoch [10/250], Train Loss: 0.000130, Val Loss: 0.000826
+🔥 Epoch [20/250], Train Loss: 0.000146, Val Loss: 0.000263
+🔥 Epoch [30/250], Train Loss: 0.000074, Val Loss: 0.001888
+🔥 Epoch [40/250], Train Loss: 0.000104, Val Loss: 0.001153
+🔥 Epoch [50/250], Train Loss: 0.000140, Val Loss: 0.000214
+🔥 Epoch [60/250], Train Loss: 0.000085, Val Loss: 0.000562
+🔥 Epoch [70/250], Train Loss: 0.000073, Val Loss: 0.001225
+🔥 Epoch [80/250], Train Loss: 0.000103, Val Loss: 0.000574
+🔥 Epoch [90/250], Train Loss: 0.000175, Val Loss: 0.000219
+🔥 Epoch [100/250], Train Loss: 0.000133, Val Loss: 0.000234
+🔥 Epoch [110/250], Train Loss: 0.000158, Val Loss: 0.000208
+🔥 Epoch [120/250], Train Loss: 0.000064, Val Loss: 0.001569
+🔥 Epoch [130/250], Train Loss: 0.000057, Val Loss: 0.002937
+🔥 Epoch [140/250], Train Loss: 0.000060, Val Loss: 0.003996
+🛑 Early Stopping at Epoch 147
+💾 儲存最佳模型 (Val Loss: 0.000208)...
+✅ [ModelManager] 成功儲存版本 v5
+   - 模型檔: F:\Gemini_CLI_Application\finance_v2\ai_short_term_day_trading\saved_models\trading_model_v5.pth
+   - 紀錄檔: F:\Gemini_CLI_Application\finance_v2\ai_short_term_day_trading\saved_models\trading_model_v5_metadata.json
+✅ 訓練完成！
