@@ -1,0 +1,35 @@
+💻 使用設備: cuda
+🔍 最終特徵欄位數量: 33
+   特徵列表: ['ret', 'vwap_bias', 'macd_hist', 'rsi', 'rsi_fast', 'body_length', 'upper_shadow', 'lower_shadow', 'body_avg_5', 'momentum_explosion', 'gap_amplitude', 'intraday_trend', 'dist_from_ma20', 'pullback_from_high', 'bounce_from_low', 'gap_filled', 'spot_futures_proxy', 'bb_width', 'is_squeeze', 'slope_vwap', 'slope_ma20', 'vol_surge_ratio', 'pv_divergence', 'noise_wavelet', 'settlement_type', 'is_settlement_day', 'dte', 'time_sin', 'time_cos', 'nasdaq_prev_ret', 'nikkei_premarket_momentum', 'us_tw_gap_divergence', 'pc_ratio']
+📊 準備多時間尺度 (MTF) 張量與驗證集劃分...
+⚡ 正在執行時序索引優化...
+🛠️ 正在合成時序張量 (這可能需要一點時間)...
+   ⌛ 已完成 0%
+   ⌛ 已完成 10%
+   ⌛ 已完成 20%
+   ⌛ 已完成 30%
+   ⌛ 已完成 40%
+   ⌛ 已完成 50%
+   ⌛ 已完成 60%
+   ⌛ 已完成 70%
+   ⌛ 已完成 80%
+   ⌛ 已完成 90%
+✅ 數據就緒 (已排除 40 筆重疊樣本): Train=436888, Val=109183
+📊 訓練集標籤分佈: {0: np.int64(0), 1: np.int64(0), 2: np.int64(209555), 3: np.int64(11797), 4: np.int64(215536), 5: np.int64(0), 6: np.int64(0)}
+   alpha_weights: [0.         0.         0.48381679 2.03912646 0.47705675 0.
+ 0.        ]
+🚀 開始訓練...
+🔥 Epoch [10/250], Train Loss: 0.160562, Val Loss: 0.112584
+🔥 Epoch [20/250], Train Loss: 0.157684, Val Loss: 0.112682
+Response Code: 0 | Event Code: 12 | Info: Session '(c0,s1)_sinopac' keep-alive on tcp_TxRx detected session down, client name 'PYAPI/Q123781600/0618/205137/816797/36.236.26.8', VPN name 'sinopac', peer host '210.59.255.161:80' address 'IP 210.59.255.161', connection 'tcp_TxRx' local address 'IP 1 | Event: Session reconnecting
+Response Code: 0 | Event Code: 13 | Info: host '210.59.255.161:80', hostname '210.59.255.161:80' IP 210.59.255.161:80 (host 1 of 1) (host connection attempt 1 of 1) (total reconnection attempt 5 of 10) | Event: Session reconnected
+🔥 Epoch [30/250], Train Loss: 0.138059, Val Loss: 0.123010
+🔥 Epoch [40/250], Train Loss: 0.148199, Val Loss: 0.118221
+🔥 Epoch [50/250], Train Loss: 0.131752, Val Loss: 0.124857
+🔥 Epoch [60/250], Train Loss: 0.111156, Val Loss: 0.158119
+🛑 Early Stopping at Epoch 60
+💾 儲存最佳模型 (Val Loss: 0.112584)...
+✅ [ModelManager] 成功儲存版本 v6
+   - 模型檔: F:\Gemini_CLI_Application\finance_v2\ai_short_term_day_trading\saved_models\trading_model_v6.pth
+   - 紀錄檔: F:\Gemini_CLI_Application\finance_v2\ai_short_term_day_trading\saved_models\trading_model_v6_metadata.json
+✅ 訓練完成！

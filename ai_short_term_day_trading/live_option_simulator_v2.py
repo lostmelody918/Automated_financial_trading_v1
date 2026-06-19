@@ -1,4 +1,9 @@
 import os
+import sys
+if sys.stdout.encoding != 'utf-8':
+    sys.stdout.reconfigure(encoding='utf-8')
+if sys.stderr.encoding != 'utf-8':
+    sys.stderr.reconfigure(encoding='utf-8')
 import time
 import json
 import torch
@@ -16,7 +21,7 @@ import shioaji as sj
 from datetime import datetime
 
 from data_engine import DayTradingDataEngine
-from composite_ai import CompositeDayTradingAI
+from composite_ai import MultiTimeframeCompositeAI
 from model_manager import TradingModelManager
 from strategy_factory import StrategyFactory
 from delta_gamma_theta import get_dynamic_bsm_bounds, get_api_based_dte
@@ -33,51 +38,52 @@ WINDOW_SIZE = 40
 class PositionManager:
     def __init__(self, db_path="position_state.db"):
         self.db_path = db_path
+        # 🚀 建立單一持久連線，解決 Database Locked
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=15)
         self._init_db()
         self.state = self._load_state()
 
     def _init_db(self):
-        with sqlite3.connect(self.db_path) as conn:
-            # 開啟 WAL 模式提升寫入效能，避免主迴圈卡頓
-            conn.execute("PRAGMA journal_mode=WAL;")
-            conn.execute('''
-                CREATE TABLE IF NOT EXISTS position_state (
-                    id INTEGER PRIMARY KEY,
-                    position INTEGER,
-                    entry_price REAL,
-                    num_contracts INTEGER,
-                    highest_price_since_entry REAL,
-                    active_contract_symbol TEXT,
-                    entry_time TEXT,
-                    trade_capital_used REAL,
-                    hard_tp_price REAL,
-                    hard_sl_price REAL,
-                    strategy_label TEXT
-                )
+        # 開啟 WAL 模式提升寫入效能，避免主迴圈卡頓
+        self.conn.execute("PRAGMA journal_mode=WAL;")
+        self.conn.execute('''
+            CREATE TABLE IF NOT EXISTS position_state (
+                id INTEGER PRIMARY KEY,
+                position INTEGER,
+                entry_price REAL,
+                num_contracts INTEGER,
+                highest_price_since_entry REAL,
+                active_contract_symbol TEXT,
+                entry_time TEXT,
+                trade_capital_used REAL,
+                hard_tp_price REAL,
+                hard_sl_price REAL,
+                strategy_label TEXT
+            )
+        ''')
+        cur = self.conn.execute("SELECT id FROM position_state WHERE id=1")
+        if not cur.fetchone():
+            self.conn.execute('''
+                INSERT INTO position_state (
+                    id, position, entry_price, num_contracts,
+                    highest_price_since_entry, active_contract_symbol,
+                    entry_time, trade_capital_used, hard_tp_price, hard_sl_price, strategy_label
+                ) VALUES (1, 0, 0.0, 0, 0.0, NULL, NULL, 0.0, 0.0, 0.0, NULL)
             ''')
-            cur = conn.execute("SELECT id FROM position_state WHERE id=1")
-            if not cur.fetchone():
-                conn.execute('''
-                    INSERT INTO position_state (
-                        id, position, entry_price, num_contracts,
-                        highest_price_since_entry, active_contract_symbol,
-                        entry_time, trade_capital_used, hard_tp_price, hard_sl_price, strategy_label
-                    ) VALUES (1, 0, 0.0, 0, 0.0, NULL, NULL, 0.0, 0.0, 0.0, NULL)
-                ''')
+        self.conn.commit()
 
     def _load_state(self):
-        with sqlite3.connect(self.db_path) as conn:
-            conn.row_factory = sqlite3.Row
-            row = conn.execute("SELECT * FROM position_state WHERE id=1").fetchone()
-            return dict(row)
+        self.conn.row_factory = sqlite3.Row
+        row = self.conn.execute("SELECT * FROM position_state WHERE id=1").fetchone()
+        return dict(row)
 
     def update(self, **kwargs):
         for k, v in kwargs.items():
             self.state[k] = v
-        with sqlite3.connect(self.db_path) as conn:
-            set_clause = ", ".join([f"{k}=?" for k in kwargs.keys()])
-            values = list(kwargs.values()) + [1]
-            conn.execute(f"UPDATE position_state SET {set_clause} WHERE id=?", values)
+        set_clause = ", ".join([f"{k}=?" for k in kwargs.keys()])
+        values = list(kwargs.values()) + [1]
+        self.conn.execute(f"UPDATE position_state SET {set_clause} WHERE id=?", values)
+        self.conn.commit()
 
     def clear_position(self):
         self.update(
@@ -436,7 +442,6 @@ def run_live_simulator():
     # --- Recovery Logic (防止重開導致當日已平倉資料與損益遺失) ---
     try:
         from post_market_export import PostMarketExporter
-        import json
         exporter = PostMarketExporter()
         today_str = datetime.now().strftime('%Y%m%d')
         recovered_trades_file = os.path.join(exporter.export_dir, f"cli_trade_log_{today_str}.jsonl")
@@ -480,7 +485,14 @@ def run_live_simulator():
         try:
             symbol = getattr(tick, 'code', None)
             if not symbol: return
-            now = datetime.now()
+
+            # 🚀 優先獲取交易所時間 (防網路延遲)
+            exchange_time = getattr(tick, 'datetime', getattr(tick, 'time', None))
+            if exchange_time:
+                now = exchange_time if hasattr(exchange_time, 'year') else datetime.combine(datetime.now().date(), exchange_time)
+            else:
+                now = datetime.now()
+
             price = getattr(tick, 'close', None)
             if price is None: return
 
@@ -498,7 +510,13 @@ def run_live_simulator():
         try:
             symbol = getattr(bidask, 'code', None)
             if not symbol: return
-            now = datetime.now()
+
+            # 🚀 優先獲取交易所時間 (防網路延遲)
+            exchange_time = getattr(bidask, 'datetime', getattr(bidask, 'time', None))
+            if exchange_time:
+                now = exchange_time if hasattr(exchange_time, 'year') else datetime.combine(datetime.now().date(), exchange_time)
+            else:
+                now = datetime.now()
 
             # Shioaji 的 BidAsk 物件有 bid_price / ask_price 陣列 (Decimals)
             bids = getattr(bidask, 'bid_price', [])
@@ -515,7 +533,22 @@ def run_live_simulator():
     def quote_callback(topic, quote):
         try:
             symbol = topic.split('/')[-1]
-            now = datetime.now()
+
+            # 🚀 優先獲取交易所時間 (防網路延遲)
+            exchange_time = getattr(quote, 'Time', getattr(quote, 'time', None))
+            if exchange_time:
+                if isinstance(exchange_time, str):
+                    try:
+                        time_obj = datetime.strptime(exchange_time[:8], "%H:%M:%S").time()
+                        now = datetime.combine(datetime.now().date(), time_obj)
+                    except:
+                        now = datetime.now()
+                elif hasattr(exchange_time, 'year'):
+                    now = exchange_time
+                else:
+                    now = datetime.combine(datetime.now().date(), exchange_time)
+            else:
+                now = datetime.now()
 
             price = getattr(quote, 'close', getattr(quote, 'Close', None))
             bid_prices = getattr(quote, 'BidPrice', getattr(quote, 'bid_price', []))
@@ -580,7 +613,7 @@ def run_live_simulator():
 
         # 在 is_market_open(current_time) 前面可以設定一個 last_export_time
         if 'last_export_time' not in locals():
-            last_export_time = current_time
+            last_export_time = now
 
         if is_today_settlement is None and is_market_open(current_time):
             try:
@@ -595,7 +628,7 @@ def run_live_simulator():
                 is_today_settlement = False
 
         # 每 30 分鐘定期匯出 (例如 HH:00 或 HH:30 附近，或超過 30 分鐘未匯出)
-        if (current_time - last_export_time).total_seconds() >= 1800 or (is_eod_closing_time(now, is_settlement=is_today_settlement) and pos_manager.get('position') == 0 and not eod_report_done):
+        if (now - last_export_time).total_seconds() >= 1800 or (is_eod_closing_time(now, is_settlement=is_today_settlement) and pos_manager.get('position') == 0 and not eod_report_done):
 
             is_eod = is_eod_closing_time(now, is_settlement=is_today_settlement)
 
@@ -623,7 +656,7 @@ def run_live_simulator():
                     df_to_export = df_raw
 
                 exporter.execute_export(df_to_export, dict_options_history, trade_log)
-                last_export_time = current_time # 更新最後匯出時間
+                last_export_time = now # 更新最後匯出時間
             except Exception as exp_err:
                 print(f"⚠️ 匯出盤後/定期資料失敗: {exp_err}")
             # ----------------------------------------

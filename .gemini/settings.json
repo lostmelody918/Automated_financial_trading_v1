@@ -1,10 +1,19 @@
 {
   "mcpServers": {
-    "finance": {
-      "command": "npx",
+    "sqlite": {
+      "command": "npx.cmd",
       "args": [
         "-y",
-        "@modelcontextprotocol/server-finance"
+        "@modelcontextprotocol/server-sqlite",
+        "F:\\Gemini_CLI_Application\\finance_v2\\ai_short_term_day_trading\\position_state.db"
+      ]
+    },
+    "filesystem": {
+      "command": "npx.cmd",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "F:\\Gemini_CLI_Application\\finance_v2"
       ]
     }
   }

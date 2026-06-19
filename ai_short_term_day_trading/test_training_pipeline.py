@@ -6,6 +6,11 @@ import sys
 import unittest
 from datetime import datetime, timedelta
 
+if sys.stdout.encoding != 'utf-8':
+    sys.stdout.reconfigure(encoding='utf-8')
+if sys.stderr.encoding != 'utf-8':
+    sys.stderr.reconfigure(encoding='utf-8')
+
 # 加入當前目錄到路徑以匯入模組
 sys.path.append(os.path.dirname(__file__))
 
@@ -47,7 +52,7 @@ class TestTrainingPipeline(unittest.TestCase):
         print("🔎 測試 2: 標籤正確性...")
         labels = vectorized_triple_barrier(self.mock_df)
         self.assertEqual(len(labels), len(self.mock_df), "標籤長度需與數據一致")
-        unique_labels = labels.unique()
+        unique_labels = labels.dropna().unique()
         # 標籤應在 0-6 之間
         for lbl in unique_labels:
             self.assertTrue(0 <= lbl <= 6, f"無效標籤: {lbl}")

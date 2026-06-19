@@ -229,9 +229,10 @@ class DayTradingDataEngine:
         df['slope_ma20'] = (df['ma_20'] - df['ma_20'].shift(3)) / (df['ma_20'].shift(3) + 1e-9) * 10000
         df['vol_surge_ratio'] = df['mock_volume'] / (df['mock_volume'].rolling(20).mean() + 1e-9)
         df['pv_divergence'] = np.where((df['Close'].pct_change() > 0) & (df['vol_surge_ratio'] < 0.8), -1, 0)
-        # 小波與分數階簡略，保持特徵維度
-        df['close_frac_diff'] = df['Close'].diff().fillna(0)
-        df['trend_wavelet'], df['noise_wavelet'] = df['Close'], df['Close'].diff().fillna(0)
+        # 小波與分數階：使用比率型特徵替代絕對值
+        df['close_frac_diff'] = df['Close'].pct_change().fillna(0)  # 報酬率 (非絕對差值)
+        df['trend_wavelet'] = df['Close'].pct_change(5).fillna(0)   # 5 根 K 線的累積報酬率
+        df['noise_wavelet'] = (df['Close'].pct_change() - df['Close'].pct_change().rolling(5).mean()).fillna(0)  # 去趨勢後的噪聲
         df = self.add_expiration_features(df)
 
         # --------------------------------------------------
@@ -307,32 +308,61 @@ class DayTradingDataEngine:
             ndx_ret = ndx_close.pct_change().shift(1)
             ndx_df = pd.DataFrame({'date_only': ndx_close.index.tz_localize(None).date, 'nasdaq_prev_ret': ndx_ret.values})
 
-            n225 = yf.download('^N225', period='1000d', interval='15m', progress=False)
-            if isinstance(n225.columns, pd.MultiIndex):
-                n225_open = n225['Open'].iloc[:, 0]
-                n225_close = n225['Close'].iloc[:, 0]
+            # 1. 抓取 1000 天的 Nikkei Daily 資料做為備用 (Proxy)
+            n225_daily = yf.download('^N225', period='1000d', interval='1d', progress=False)
+            if isinstance(n225_daily.columns, pd.MultiIndex):
+                n225_d_open = n225_daily['Open'].iloc[:, 0]
+                n225_d_close = n225_daily['Close'].iloc[:, 0]
             else:
-                n225_open = n225['Open']
-                n225_close = n225['Close']
+                n225_d_open = n225_daily['Open']
+                n225_d_close = n225_daily['Close']
+            
+            n225_d_prev_close = n225_d_close.shift(1)
+            n225_daily_momentum = (n225_d_open / n225_d_prev_close) - 1.0
+            nikkei_daily_df = pd.DataFrame({
+                'date_only': n225_d_open.index.tz_localize(None).date, 
+                'nikkei_premarket_momentum': n225_daily_momentum.values
+            })
 
-            n225_df = pd.DataFrame({'datetime': n225_open.index})
-            n225_df['date_only'] = n225_df['datetime'].dt.tz_localize(None).dt.date
-            n225_df['time'] = n225_df['datetime'].dt.tz_localize(None).dt.time
-            n225_df['open'] = n225_open.values
-            n225_df['close'] = n225_close.values
-
+            # 2. 抓取近 60 天的 15m 資料取得更精準的盤前動能
+            n225 = yf.download('^N225', period='60d', interval='15m', progress=False)
             nikkei_features = []
-            for d, grp in n225_df.groupby('date_only'):
-                try:
-                    open_price = grp.iloc[0]['open']
-                    close_0845 = grp.iloc[2]['close'] # JST 15m intervals
-                    momentum = (close_0845 / open_price) - 1.0
-                    nikkei_features.append({'date_only': d, 'nikkei_premarket_momentum': momentum})
-                except IndexError: pass
+            if not n225.empty:
+                if isinstance(n225.columns, pd.MultiIndex):
+                    n225_open = n225['Open'].iloc[:, 0]
+                    n225_close = n225['Close'].iloc[:, 0]
+                else:
+                    n225_open = n225['Open']
+                    n225_close = n225['Close']
 
-            nikkei_df = pd.DataFrame(nikkei_features)
-            global_df = pd.merge(ndx_df, nikkei_df, on='date_only', how='outer').dropna()
-            global_df.to_parquet(cache_file)
+                n225_df = pd.DataFrame({'datetime': n225_open.index})
+                n225_df['date_only'] = n225_df['datetime'].dt.tz_localize(None).dt.date
+                n225_df['open'] = n225_open.values
+                n225_df['close'] = n225_close.values
+
+                for d, grp in n225_df.groupby('date_only'):
+                    try:
+                        open_price = grp.iloc[0]['open']
+                        close_0845 = grp.iloc[2]['close'] # JST 15m intervals
+                        momentum = (close_0845 / open_price) - 1.0
+                        nikkei_features.append({'date_only': d, 'nikkei_premarket_momentum': momentum})
+                    except IndexError: pass
+
+            nikkei_15m_df = pd.DataFrame(nikkei_features, columns=['date_only', 'nikkei_premarket_momentum'])
+            
+            # 將精確的 15m 動能覆蓋掉 Daily 算出來的代理動能
+            nikkei_df = nikkei_daily_df.set_index('date_only')
+            if not nikkei_15m_df.empty:
+                nikkei_df.update(nikkei_15m_df.set_index('date_only'))
+            nikkei_df = nikkei_df.reset_index()
+
+            if ndx_df.empty and nikkei_df.empty:
+                global_df = pd.DataFrame(columns=['date_only', 'nasdaq_prev_ret', 'nikkei_premarket_momentum'])
+            else:
+                global_df = pd.merge(ndx_df, nikkei_df, on='date_only', how='outer').dropna()
+            
+            if not global_df.empty:
+                global_df.to_parquet(cache_file)
             return global_df
         except Exception as e:
             print(f"⚠️ 抓取國際指數失敗: {e}")

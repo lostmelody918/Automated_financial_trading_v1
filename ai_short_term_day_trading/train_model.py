@@ -79,14 +79,17 @@ def prepare_training_data():
     df = engine.integrate_institutional_chips(df_raw, df_real_chips)
     print(f"📊 融合後數據量: {df.shape}")
 
+    # 執行三重屏障標記
     df['label'] = vectorized_triple_barrier(df)
     before_drop = len(df)
-    df.dropna(subset=['label'], inplace=True)
+    
+    # 🚀 必須加上這兩行！清空邊界 NaN 並強制轉回整數 (Int) 
+    df = df.dropna(subset=['label']).copy()
+    df['label'] = df['label'].astype(int)
+    
     after_drop = len(df)
     print(f"🏷️ 標籤生成完成，過濾掉 {before_drop - after_drop} 筆無效末端數據，剩餘 {after_drop} 筆")
 
-    if not df.empty:
-        df['label'] = df['label'].astype(int)
     return df
 
 def train_one_run(df, config):
@@ -115,14 +118,40 @@ def train_one_run(df, config):
     use_wandb = wandb.run is not None
 
     # 特徵工程與歸一化
+    # --- 排除不適合作為特徵的欄位 ---
+    # 1. 原始 OHLCV 絕對價格
     absolute_cols = ['Open', 'High', 'Low', 'Close', 'vwap', 'bb_upper', 'bb_lower', 'Volume']
-    exclude_cols = ['date', 'time', 'date_only', 'day_of_week', 'label'] + absolute_cols
+    # 2. 中間計算欄位 (含絕對價格值、累計量、原始 Close 複製品)
+    intermediate_cols = [
+        'Amount', 'mock_volume', 'vol_price', 'cum_vol_price', 'cum_vol',
+        'tr', 'atr', 'daily_open', 'yesterday_close',
+        'sma20', 'vwap_5', 'ma_20',
+        'trend_wavelet',  # 這是 Close 的直接複製品，嚴重洩漏
+        'close_frac_diff',  # Close.diff() 含絕對價格差
+        'macd', 'signal',  # EMA 差值含絕對價格尺度
+    ]
+    # 3. 常數或近常數欄位 (zero-variance)
+    constant_cols = ['foreign_net_oi', 'dealer_net_oi']
+    # 4. 絕對金額欄位 (千億級別)
+    large_value_cols = ['foreign_spot_net', 'dealer_spot_net']
+    exclude_cols = (
+        ['date', 'time', 'date_only', 'day_of_week', 'label']
+        + absolute_cols + intermediate_cols + constant_cols + large_value_cols
+    )
     feature_cols = [c for c in df.columns if c not in exclude_cols and not c.startswith('future_')]
 
-    print(f"🔍 特徵欄位數量: {len(feature_cols)}")
-
+    # 額外安全檢查：移除只有 1 個唯一值的常數特徵
     df_feat = df[feature_cols].copy()
     df_numeric = df_feat.select_dtypes(include=[np.number])
+    constant_mask = df_numeric.nunique() <= 1
+    if constant_mask.any():
+        dropped = constant_mask[constant_mask].index.tolist()
+        print(f"⚠️ 移除常數特徵: {dropped}")
+        df_numeric = df_numeric.drop(columns=dropped)
+        feature_cols = [c for c in feature_cols if c in df_numeric.columns]
+
+    print(f"🔍 最終特徵欄位數量: {len(feature_cols)}")
+    print(f"   特徵列表: {feature_cols}")
 
     train_split_idx = int(len(df_numeric) * 0.8)
     if train_split_idx < 100:
@@ -135,6 +164,8 @@ def train_one_run(df, config):
     iqr = (df_numeric.iloc[:train_split_idx].quantile(0.75) - df_numeric.iloc[:train_split_idx].quantile(0.25)).replace(0, 1.0)
 
     df_norm = ((df_numeric - median) / iqr).fillna(0)
+    # 截斷極端值，避免少數異常值主導梯度
+    df_norm = df_norm.clip(-10, 10)
     input_dim = df_norm.shape[1]
 
     # MTF 數據準備
@@ -214,10 +245,19 @@ def train_one_run(df, config):
     cosine_scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min=1e-6)
     scheduler = optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[5])
 
-    class_counts = np.bincount(df['label'].iloc[:train_split_idx].dropna().astype(int), minlength=7)
-    class_counts = class_counts + 1.0
-    weights = 1.0 / np.sqrt(class_counts)
-    weights = weights / weights.sum() * len(weights)
+    # --- 類別權重計算 (僅基於訓練集，且正確處理空類別) ---
+    train_labels = Y[:split_idx]
+    class_counts = np.bincount(train_labels, minlength=7).astype(float)
+    # 診斷：印出標籤分佈
+    print(f"📊 訓練集標籤分佈: {dict(enumerate(class_counts.astype(int)))}")
+    # 對空類別給予 0 權重（不參與 loss 計算），而非 +1 後產生巨大權重
+    weights = np.zeros(7)
+    active_classes = class_counts > 0
+    weights[active_classes] = 1.0 / np.sqrt(class_counts[active_classes])
+    # 僅在有效類別間歸一化
+    if weights.sum() > 0:
+        weights = weights / weights.sum() * active_classes.sum()
+    print(f"   alpha_weights: {weights}")
     alpha_weights = torch.tensor(weights, dtype=torch.float32).to(device)
 
     def focal_loss(inputs, targets, alpha, gamma=1.5):
