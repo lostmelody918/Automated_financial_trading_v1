@@ -11,7 +11,7 @@ class CompositeOptionsStrategy:
         self.name = "Omni-Strategy AI Factory Plus"
 
     def generate_signal(self, df_slice, ai_score=None, last_win=False):
-        if ai_score is None or len(ai_score) != 7: return 0
+        if ai_score is None or len(ai_score) != 5: return 0
 
         # 若已經是機率分佈 (總和約為 1.0)，則跳過 Softmax，避免過度扁平化 (Squashing)
         if np.isclose(np.sum(ai_score), 1.0):
@@ -24,13 +24,13 @@ class CompositeOptionsStrategy:
         # 計算 AI 信心水準 (機率最高的一項)
         ai_confidence = np.max(probs)
 
-        # AI 基礎訊號轉換 (-3 到 3)
+        # AI 基礎訊號轉換 (5分類: -2 到 2)
         pred_class = np.argmax(probs)
-        mapping = {0: -3, 1: -2, 2: -1, 3: 0, 4: 1, 5: 2, 6: 3}
+        mapping = {0: -2, 1: -1, 2: 0, 3: 1, 4: 2}
         base_signal = mapping.get(pred_class, 0)
 
-        # 若 AI 信心極低 (< 35%)，強制降級基礎訊號，交由量化策略接管
-        if ai_confidence < 0.35 and base_signal != 0:
+        # 若 AI 信心偏低 (< 29%)，強制降級基礎訊號，交由量化策略接管
+        if ai_confidence < 0.29 and base_signal != 0:
             base_signal = np.sign(base_signal) * 1
 
         if df_slice.empty: return base_signal
@@ -47,6 +47,7 @@ class CompositeOptionsStrategy:
         slope_ma20 = last_row.get('slope_ma20', 0.0)
         vwap_bias = last_row.get('vwap_bias', 0.0)
         rsi_fast = last_row.get('rsi_fast', 50.0)
+        rsi_fast_prev = prev_row.get('rsi_fast', 50.0)
         vol_surge = last_row.get('vol_surge_ratio', 1.0)
         momentum_explosion = last_row.get('momentum_explosion', 0)
 
@@ -62,7 +63,7 @@ class CompositeOptionsStrategy:
         date_str = ""
         if 'date_only' in last_row:
             date_str = last_row['date_only'].strftime('%Y-%m-%d') if hasattr(last_row['date_only'], 'strftime') else str(last_row['date_only'])
-        
+
         # 簡化版 FOMC 日期
         fomc_dates = ['2026-01-28', '2026-03-18', '2026-04-29', '2026-06-17', '2026-07-29', '2026-09-16', '2026-11-04', '2026-12-16']
         is_fomc_day = date_str in fomc_dates
@@ -99,8 +100,31 @@ class CompositeOptionsStrategy:
 
         # 動態閥值計算 (Dynamic Thresholds based on ATR) - 來自學術論文降低風險的啟發
         # 在高波動率環境下，容忍更大的乖離；在低波動環境，乖離閾值縮小。
-        dynamic_bias_limit = max(0.0025, (atr / close_price) * 1.2) 
-        extreme_bias_limit = max(0.0040, (atr / close_price) * 2.0)
+        # [優化] 適度緊縮乖離容忍度，增加防護力
+        dynamic_bias_limit = max(0.0025, (atr / close_price) * 1.0)
+        extreme_bias_limit = max(0.0040, (atr / close_price) * 1.7)
+
+        # ==================================================
+        # ⚡ 第零層：特種部隊 - 波動獵手 (Volatility Sniper) [絕對最高優先級]
+        # 完全無視 AI 保守門檻與後續防禦網，針對瞬間巨幅波動進行 Level 10 極速打擊
+        # ==================================================
+        if vol_surge > 1.5 or atr_expansion > 0.15:
+            # 1. V轉抄底/摸頭 (V-Reversal)
+            if rsi_fast_prev < 20 and rsi_fast > rsi_fast_prev and macd_hist > prev_macd_hist:
+                print(f"⚡ [波動獵手] V轉抄底！RSI 極度超賣勾頭且 MACD 縮腳 (Vol_Surge={vol_surge:.1f})，強制吃 Gamma 爆發 Call！")
+                return 10
+            elif rsi_fast_prev > 80 and rsi_fast < rsi_fast_prev and macd_hist < prev_macd_hist:
+                print(f"⚡ [波動獵手] V轉摸頭！RSI 極度超買勾頭且 MACD 縮腳 (Vol_Surge={vol_surge:.1f})，強制吃 Gamma 爆發 Put！")
+                return -10
+            
+            # 2. 嘎空/殺多突破 (Breakout)
+            if prev_squeeze == 1 or is_squeeze == 1:
+                if close_price > bb_upper:
+                    print(f"⚡ [波動獵手] 嘎空突破！狹幅震盪後帶量突破上軌 (Vol_Surge={vol_surge:.1f})，強制追擊 Call！")
+                    return 10
+                elif close_price < bb_lower:
+                    print(f"⚡ [波動獵手] 殺多跌破！狹幅震盪後帶量跌破下軌 (Vol_Surge={vol_surge:.1f})，強制追擊 Put！")
+                    return -10
 
         # ==================================================
         # 🛡️ 第一層：絕對防禦網 (Safety Nets)
@@ -115,23 +139,44 @@ class CompositeOptionsStrategy:
             # 1. 結算日防護 (Gamma/Theta 雙刃劍)
             if is_settlement_day:
                 if settlement_type == 2: # 期貨月大結算
-                    if vol_surge < 1.8 or (abs(base_signal) < 2 and abs(slope_ma20) < 3.5):
+                    if vol_surge < 1.7 or (abs(base_signal) < 2 and abs(slope_ma20) < 1.5):
                         print(f"🛡️ [月結算保護] 動能不足以對抗 Theta (Vol={vol_surge:.2f})，沒收訊號。")
                         base_signal = 0
                 elif settlement_type == 1 or dte < 0.5: # 週結算 / 0DTE
-                    if abs(vwap_bias) > dynamic_bias_limit:
-                        print(f"🛡️ [週結算/0DTE保護] 動態乖離過大防追高殺低 (Bias={vwap_bias:.5f}, 極限={dynamic_bias_limit:.5f})，沒收訊號。")
+                    # [優化] 當有明確強烈趨勢 (abs(slope_ma20) >= 2.5) 時，不因乖離過大而沒收訊號
+                    if abs(vwap_bias) > dynamic_bias_limit * 1.5 and abs(slope_ma20) < 2.5:
+                        print(f"🛡️ [週結算/0DTE保護] 動態乖離過大防追高殺低 (Bias={vwap_bias:.5f}, 極限={dynamic_bias_limit*1.5:.5f})，沒收訊號。")
                         base_signal = 0
 
             # 2. 動態動能耗竭防護 (Dynamic Momentum Exhaustion)
             if base_signal > 0:
-                if vwap_bias > extreme_bias_limit or (vwap_bias > dynamic_bias_limit and rsi_fast > 85):
+                if vwap_bias > extreme_bias_limit * 1.3 or (vwap_bias > dynamic_bias_limit * 1.15 and rsi_fast > 80):
                     print(f"🛡️ [過熱網] 極端多頭乖離，降級訊號以防反轉。")
                     base_signal = max(1, base_signal - 1)
             elif base_signal < 0:
-                if vwap_bias < -extreme_bias_limit or (vwap_bias < -dynamic_bias_limit and rsi_fast < 15):
+                if vwap_bias < -extreme_bias_limit * 1.3 or (vwap_bias < -dynamic_bias_limit * 1.15 and rsi_fast < 20):
                     print(f"🛡️ [過冷網] 極端空頭乖離，降級訊號以防反彈。")
                     base_signal = min(-1, base_signal + 1)
+                    
+            # 3. 大盤環境趨勢配合 (Intraday Trend Alignment)
+            intraday_trend = last_row.get('intraday_trend', 0.0)
+            if base_signal > 0 and intraday_trend < -0.005:
+                if rsi_fast < 25 and vwap_bias < -dynamic_bias_limit:
+                    print(f"🛡️ [大盤防護] 強空趨勢中，但極度超賣，允許AI搶反彈。")
+                else:
+                    print(f"🛡️ [大盤防護] 強空趨勢盤中，沒收多頭訊號以防逆勢。")
+                    base_signal = 0
+            elif base_signal > 0 and intraday_trend < 0.0 and atr > 30:
+                # 震盪偏弱且高波動，提高多單進場門檻
+                if vol_surge < 2.0 or base_signal < 2:
+                    print(f"🛡️ [大盤防護] 震盪偏弱且高波動 (ATR={atr:.1f})，提高做多門檻，動能不足沒收訊號。")
+                    base_signal = 0
+            elif base_signal < 0 and intraday_trend > 0.005:
+                if rsi_fast > 75 and vwap_bias > dynamic_bias_limit:
+                    print(f"🛡️ [大盤防護] 強多趨勢中，但極度超買，允許AI搶回檔。")
+                else:
+                    print(f"🛡️ [大盤防護] 強多趨勢盤中，沒收空頭訊號以防逆勢。")
+                    base_signal = 0
 
 
         # ==================================================
@@ -152,13 +197,26 @@ class CompositeOptionsStrategy:
                 return -10
 
             # --------------------------------------------------
+            # 🎯 策略 1.2 (新增): 積極型 V/A 轉狙擊 (Level 5) - 捕捉反曲點
+            # --------------------------------------------------
+            is_trough = last_row.get('is_trough', False)
+            if is_trough and rsi_fast < 40 and vwap_bias < -0.0010:
+                print(f"🔥 [積極V轉] 探底反曲點形成，積極抓取V型反轉做多！")
+                return 5
+
+            is_peak = last_row.get('is_peak', False)
+            if is_peak and rsi_fast > 60 and vwap_bias > 0.0010:
+                print(f"🔥 [積極V轉] 觸頂反曲點形成，積極抓取A型反轉做空！")
+                return -5
+
+            # --------------------------------------------------
             # 🧲 策略 1.5 (新增): 流動性吸收/微結構耗竭 (Microstructure Absorption) (Level 4)
             # 爆大量但價格卻收長下影線/上影線，代表大單吃貨或出貨 (Limit Order Absorption)
             # --------------------------------------------------
             if vol_surge > 2.5 and is_pin_bar_bottom and close_price > open_price and rsi_fast < 40:
                 print(f"🧲 [流動性吸收] 爆量下殺被買盤全數吸收，微結構反轉 Call！")
                 return 4
-            
+
             if vol_surge > 2.5 and is_pin_bar_top and close_price < open_price and rsi_fast > 60:
                 print(f"🧲 [流動性吸收] 爆量上漲被賣盤全數吸收，微結構反轉 Put！")
                 return -4
@@ -212,15 +270,17 @@ class CompositeOptionsStrategy:
             # --------------------------------------------------
             # 🌊 策略 6: VWAP 防守反擊 VWAP Bounce (Level 2)
             # --------------------------------------------------
-            if slope_ma20 > 1.5 and abs(vwap_bias) < 0.0008:
-                if rsi_fast < 50 and close_price > open_price:
+            if slope_ma20 > 1.0 and abs(vwap_bias) < 0.0015:
+                if rsi_fast < 60 and close_price >= open_price:
                     print(f"🌊 [VWAP反擊] 多頭回測均價線有撐，順勢買入 Call！")
                     return 2
-
-            if slope_ma20 < -1.5 and abs(vwap_bias) < 0.0008:
-                if rsi_fast > 50 and close_price < open_price:
-                    print(f"🌊 [VWAP反擊] 空頭反彈均價線遇壓，順勢買入 Put！")
+            elif slope_ma20 < -1.0 and abs(vwap_bias) < 0.0015:
+                if rsi_fast > 40 and close_price <= open_price:
+                    print(f"🌊 [VWAP反擊] 空頭回測均價線有壓，順勢買入 Put！")
                     return -2
+
+
+
 
             # --------------------------------------------------
             # ⚡ 策略 7: MACD 動能穿越 MACD Cross (Level 2)
@@ -236,12 +296,12 @@ class CompositeOptionsStrategy:
             # --------------------------------------------------
             # 🐢 策略 8: 無量緩漲/跌軋空 Squeeze Grind (Level 1)
             # --------------------------------------------------
-            if 1.0 < slope_ma20 < 2.5 and 0.0005 < vwap_bias < 0.0020 and 45 < rsi_fast < 75:
+            if 1.0 < slope_ma20 < 3.0 and 0.0003 < vwap_bias < 0.0025 and 45 < rsi_fast < 75:
                 if last_row.get('Low', 0) >= prev_row.get('Low', 0):
                     print(f"🐢 [緩漲軋空] 無量緩步墊高，順勢輕倉 Call: slope={slope_ma20:.2f}")
                     return 1
 
-            if -2.5 < slope_ma20 < -1.0 and -0.0020 < vwap_bias < -0.0005 and 25 < rsi_fast < 55:
+            if -3.0 < slope_ma20 < -1.0 and -0.0025 < vwap_bias < -0.0003 and 25 < rsi_fast < 55:
                 if last_row.get('High', 0) <= prev_row.get('High', 0):
                     print(f"🐢 [緩跌殺多] 無量緩步破底，順勢輕倉 Put: slope={slope_ma20:.2f}")
                     return -1
@@ -249,11 +309,11 @@ class CompositeOptionsStrategy:
             # --------------------------------------------------
             # 🎯 策略 9: 淺回檔順勢承接 Micro Pullback (Level 1)
             # --------------------------------------------------
-            if slope_ma20 > 2.5 and -0.0005 < vwap_bias < dynamic_bias_limit / 2 and rsi_fast < 45:
+            if slope_ma20 > 1.5 and -0.0010 < vwap_bias < dynamic_bias_limit and rsi_fast < 55:
                 print(f"🎯 [微觀回檔] 強多勢極短線拉回，承接 Call: RSI={rsi_fast:.1f}")
                 return 1
 
-            if slope_ma20 < -2.5 and -dynamic_bias_limit / 2 < vwap_bias < 0.0005 and rsi_fast > 55:
+            if slope_ma20 < -1.5 and -dynamic_bias_limit < vwap_bias < 0.0010 and rsi_fast > 45:
                 print(f"🎯 [微觀回檔] 強空勢極短線反彈，承接 Put: RSI={rsi_fast:.1f}")
                 return -1
 

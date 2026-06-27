@@ -198,7 +198,8 @@ class DayTradingDataEngine:
         df['macd'] = exp1 - exp2
         df['signal'] = df['macd'].ewm(span=9).mean()
         df['macd_hist'] = df['macd'] - df['signal']
-        df['tr'] = df[['High','Low','Close']].max(axis=1) # 簡化
+        # [FIX] 修正 TR 算法：原本錯誤取到了絕對高點(數萬點)，導致 ATR 爆表，完全摧毀所有停損停利與標籤的閾值！
+        df['tr'] = df['High'] - df['Low']
         df['atr'] = df['tr'].rolling(14).mean()
         delta = df['Close'].diff()
         gain, loss = (delta.where(delta > 0, 0)).rolling(14).mean(), (-delta.where(delta < 0, 0)).rolling(14).mean()
@@ -228,7 +229,34 @@ class DayTradingDataEngine:
         df['ma_20'] = df['Close'].rolling(20).mean()
         df['slope_ma20'] = (df['ma_20'] - df['ma_20'].shift(3)) / (df['ma_20'].shift(3) + 1e-9) * 10000
         df['vol_surge_ratio'] = df['mock_volume'] / (df['mock_volume'].rolling(20).mean() + 1e-9)
-        df['pv_divergence'] = np.where((df['Close'].pct_change() > 0) & (df['vol_surge_ratio'] < 0.8), -1, 0)
+        # pv_divergence 量價背離 (-1: 價漲量縮 / 1: 價跌量縮 / 0: 正常)
+        cond_bearish = (df['Close'].pct_change() > 0) & (df['vol_surge_ratio'] < 0.8)
+        cond_bullish = (df['Close'].pct_change() < 0) & (df['vol_surge_ratio'] < 0.8)
+        df['pv_divergence'] = np.where(cond_bearish, -1, np.where(cond_bullish, 1, 0))
+        
+        # --------------------------------------------------
+        # 📊 OBV (能量潮指標) 及其穩定衍生特徵
+        # --------------------------------------------------
+        direction = np.sign(df['Close'].diff().fillna(0))
+        df['obv'] = (direction * df['mock_volume']).cumsum()
+        df['obv_sma20'] = df['obv'].rolling(20).mean()
+        obv_std20 = df['obv'].rolling(20).std() + 1e-9
+        # obv_bias: 當下買賣氣勢距離均值的乖離程度 (Z-score 概念，避免無限變大)
+        df['obv_bias'] = (df['obv'] - df['obv_sma20']) / obv_std20
+        # obv_slope: 評估近 5 分鐘主力籌碼流向的斜率
+        df['obv_slope'] = (df['obv'] - df['obv'].shift(5)) / obv_std20
+
+        # --------------------------------------------------
+        # 📈 微觀訂單流代理 (Micro Order Flow Proxies)
+        # --------------------------------------------------
+        # OIP (Orderbook Imbalance Proxy): K棒內買賣氣勢失衡比例
+        df['orderbook_imbalance'] = ((df['Close'] - df['Low']) - (df['High'] - df['Close'])) / (df['High'] - df['Low'] + 1e-9)
+        # VD (Volume Delta): 淨買賣力道估算
+        df['volume_delta'] = df['mock_volume'] * df['orderbook_imbalance']
+        # CVD (Cumulative Volume Delta): 累積淨買賣力道 (常態化)
+        df['cvd'] = df.groupby('date_only')['volume_delta'].cumsum()
+        df['cvd_bias'] = (df['cvd'] - df['cvd'].rolling(20).mean()) / (df['cvd'].rolling(20).std() + 1e-9)
+
         # 小波與分數階：使用比率型特徵替代絕對值
         df['close_frac_diff'] = df['Close'].pct_change().fillna(0)  # 報酬率 (非絕對差值)
         df['trend_wavelet'] = df['Close'].pct_change(5).fillna(0)   # 5 根 K 線的累積報酬率
@@ -243,18 +271,46 @@ class DayTradingDataEngine:
         df['time_cos'] = np.cos(2 * np.pi * minutes_of_day / 1440.0)
 
         # --------------------------------------------------
+        # 🔥 微結構特徵 (Microstructure) & 時段慣性 (Regime)
+        # --------------------------------------------------
+        # 努力與結果比 (Volume-to-Range Ratio)：爆量但不漲跌，代表強大吸收阻力
+        df['vol_range_ratio'] = df['mock_volume'] / (df['body_length'] + 1e-9)
+        # 正規化一下，避免極端值
+        df['vol_range_ratio'] = (df['vol_range_ratio'] / df['vol_range_ratio'].rolling(20).mean()).fillna(1.0)
+        
+        # 時段戰區 ID (Categorical Regime ID)
+        condlist = [
+            (minutes_of_day >= 525) & (minutes_of_day <= 555),  # 08:45-09:15 台股開盤衝刺
+            (minutes_of_day > 555) & (minutes_of_day <= 630),   # 09:16-10:30 早盤震盪
+            (minutes_of_day > 630) & (minutes_of_day <= 720),   # 10:31-12:00 盤中死水
+            (minutes_of_day > 720) & (minutes_of_day <= 825),   # 12:01-13:45 尾盤與結算
+            (minutes_of_day > 825) & (minutes_of_day < 900),    # 13:46-14:59 收盤休息
+            (minutes_of_day >= 900) & (minutes_of_day < 1290),  # 15:00-21:29 歐股開盤/美股盤前
+            (minutes_of_day >= 1290) & (minutes_of_day <= 1380) # 21:30-23:00 美股開盤衝刺
+        ]
+        choicelist = [0, 1, 2, 3, 4, 5, 6]
+        df['regime_id'] = np.select(condlist, choicelist, default=7) # 其餘時間為 7 (夜盤死水/洗盤)
+
+        # --------------------------------------------------
         # 🌍 整合美股與日股全域特徵 (Global Features)
         # --------------------------------------------------
         global_df = self.fetch_global_indices()
         if not global_df.empty:
             df['date_only_dt'] = pd.to_datetime(df['date_only'])
             global_df['date_only_dt'] = pd.to_datetime(global_df['date_only'])
+            
+            # 必須嚴格按照 'date' 排序，避免 pandas quicksort 把同日的分鐘 K 線亂數洗牌
+            df = df.sort_values('date')
+            
             df = pd.merge_asof(
-                df.sort_values('date_only_dt'),
+                df,
                 global_df.sort_values('date_only_dt'),
-                on='date_only_dt',
+                left_on='date_only_dt',
+                right_on='date_only_dt',
                 direction='backward'
             )
+            
+            df = df.sort_values('date').reset_index(drop=True)
             df.drop(columns=['date_only_dt', 'date_only_y'], inplace=True, errors='ignore')
             if 'date_only_x' in df.columns:
                 df.rename(columns={'date_only_x': 'date_only'}, inplace=True)
@@ -434,16 +490,31 @@ class DayTradingDataEngine:
             for cat in ['TXO', 'TX1', 'TX2', 'TX4', 'TX5']:
                 if hasattr(self.api.Contracts.Options, cat): txo_list.extend(list(getattr(self.api.Contracts.Options, cat)))
             if not txo_list: return None
-            filtered_txo = [c for c in txo_list if c.option_right == option_type and abs(c.strike_price - current_price) <= 500]
+
+            # 確保只選擇「最近到期日 (Nearest Expiration)」的合約，避免買到遠月份或遠週合約
+            valid_dates = [c.delivery_date for c in txo_list if hasattr(c, 'delivery_date') and c.delivery_date]
+            if valid_dates:
+                nearest_date = min(valid_dates)
+                txo_list = [c for c in txo_list if getattr(c, 'delivery_date', '') == nearest_date]
+
+            filtered_txo = [c for c in txo_list if (getattr(c.option_right, 'name', str(c.option_right)) == option_type or getattr(c.option_right, 'value', str(c.option_right)) == option_type[0])]
+            
+            # [FIX] 依照履約價與目前指數的距離排序，取代死板的 500 點限制 (應對極端千點大行情)
+            filtered_txo.sort(key=lambda x: abs(x.strike_price - current_price))
+            filtered_txo = filtered_txo[:30] # 擴大範圍至上下15檔
+            
             if not filtered_txo: return None
             snapshots = self.api.snapshots(filtered_txo)
             if not snapshots: return filtered_txo[0]
             best_v, best_contract = -1, None
             for s in snapshots:
-                # 絕對禁止買入「無賣盤(ask_price <= 0)」或「零成交量」的合約
-                if getattr(s, 'ask_price', 0) <= 0 or getattr(s, 'volume', 0) == 0:
+                # 絕對禁止買入「無賣盤」或「零成交量」的合約
+                ask_p = getattr(s, 'sell_price', 0)
+                if not ask_p and hasattr(s, 'asks') and s.asks:
+                    ask_p = s.asks[0].price
+                if ask_p <= 0 or getattr(s, 'volume', 0) == 0:
                     continue
-                if s.ask_price * 50 > allocated_capital: continue
+                if ask_p * 50 > allocated_capital: continue
                 if s.volume > best_v:
                     best_v = s.volume
                     for c in filtered_txo:
@@ -461,8 +532,11 @@ class DayTradingDataEngine:
         df_chips['date_dt'] = pd.to_datetime(df_chips['date']).dt.as_unit('us')
         df_intraday['date_only_dt'] = pd.to_datetime(df_intraday['date_only']).dt.as_unit('us')
 
+        # 必須確保原始數據按確切時間(date)排序，避免 Pandas 預設的快速排序(quicksort)打亂同日內的時序
+        df_intraday = df_intraday.sort_values('date')
+        
         df_merged = pd.merge_asof(
-            df_intraday.sort_values('date_only_dt'),
+            df_intraday,
             df_chips.sort_values('date_dt'),
             left_on='date_only_dt',
             right_on='date_dt',
@@ -483,4 +557,5 @@ class DayTradingDataEngine:
         numeric_cols = df_merged.select_dtypes(include=[np.number]).columns
         df_merged[numeric_cols] = df_merged[numeric_cols].fillna(0.0)
 
-        return df_merged.reset_index(drop=True)
+        # [極度關鍵修復] 確保最終輸出的 K 線完全按照時間順序排列，否則繪圖會變義大利麵，且破壞 AI 的 RNN 學習邏輯
+        return df_merged.sort_values('date').reset_index(drop=True)

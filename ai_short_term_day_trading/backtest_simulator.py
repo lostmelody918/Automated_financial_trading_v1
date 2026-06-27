@@ -10,11 +10,11 @@ plt.rcParams['axes.unicode_minus'] = False # 正常顯示負號
 import torch
 from data_engine import DayTradingDataEngine
 from strategy_factory import StrategyFactory
-from composite_ai import MultiTimeframeCompositeAI
+from composite_ai import TriCoreMarketEngine
 from model_manager import TradingModelManager
 from delta_gamma_theta import calculate_bs_greeks, get_dynamic_bsm_bounds
 
-def save_trade_plot(df, entry_idx, exit_idx, trade_type, ret, trade_id, entry_features=None, trade_capital=0, position_dir=1):
+def save_trade_plot(df, entry_idx, exit_idx, trade_type, ret, trade_id, entry_features=None, trade_capital=0, position_dir=1, version_str="vUnknown", today_str="19700101"):
     """助手函數：繪製單筆交易的波段圖，並標註特徵與儲存資料"""
     try:
         # 動態調整 X 軸區間 (前後多抓一些 K 線)
@@ -67,7 +67,7 @@ def save_trade_plot(df, entry_idx, exit_idx, trade_type, ret, trade_id, entry_fe
             feature_text = "\n".join([f"{k}: {v:.4f}" if isinstance(v, float) else f"{k}: {v}" for k, v in entry_features.items() if k != 'entry_date'])
             plt.gcf().text(0.02, 0.5, feature_text, fontsize=8, bbox=dict(facecolor='white', alpha=0.8))
 
-        filename_base = f"trade_{trade_id:03d}_{trade_type}_{'WIN' if ret > 0 else 'LOSS'}"
+        filename_base = f"trade_{trade_id:03d}_{trade_type}_{'WIN' if ret > 0 else 'LOSS'}_{version_str}_{today_str}"
         plt.tight_layout(rect=[0.15, 0, 1, 1]) # 留空間給左側文字
         plt.savefig(os.path.join(plots_dir, f"{filename_base}.png"))
         plt.close()
@@ -81,6 +81,13 @@ def save_trade_plot(df, entry_idx, exit_idx, trade_type, ret, trade_id, entry_fe
                 f.write("-" * 20 + "\n")
                 for k, v in entry_features.items():
                     f.write(f"{k}: {v}\n")
+
+        # 匯出持倉期間的每一分鐘所有特徵軌跡 (CSV)
+        holding_df = df.iloc[entry_idx:exit_idx+1].copy()
+        csv_filename = f"{filename_base}_trajectory.csv"
+        # 使用 utf-8-sig 確保 Excel 打開不會亂碼
+        holding_df.to_csv(os.path.join(plots_dir, csv_filename), index=False, encoding='utf-8-sig')
+
     except Exception as e:
         print(f"Plot saving failed: {e}")
 
@@ -106,8 +113,7 @@ def run_advanced_simulator(initial_capital=100000, days=5):
             norm_params = json.load(f)
 
         # 過濾掉無法正規化的欄位 (如 date_x, date_y)
-        valid_cols = [c for c in norm_params['feature_cols'] if c in norm_params['mean'] and c in df.columns]
-        norm_params['feature_cols'] = valid_cols
+        valid_cols = [c for c in norm_params['mean'].keys() if c in df.columns]
 
         mean_v = np.array([norm_params['mean'][c] for c in valid_cols])
         std_v = np.array([norm_params['std'][c] for c in valid_cols])
@@ -117,8 +123,23 @@ def run_advanced_simulator(initial_capital=100000, days=5):
         feature_cols = [c for c in df.columns if c not in ['date', 'time', 'date_only', 'day_of_week', 'date_x', 'date_y']]
         input_dim = len(feature_cols)
 
+    # 定義 Tri-Core 特徵分流
+    macro_cols = ['nasdaq_prev_ret', 'nikkei_premarket_momentum', 'pc_ratio', 'us_tw_gap_divergence', 'settlement_type', 'is_settlement_day', 'dte', 'gap_amplitude', 'gap_filled', 'time_sin', 'time_cos']
+    meso_cols = ['macd_hist', 'vwap_bias', 'bb_width', 'is_squeeze', 'slope_vwap', 'slope_ma20', 'dist_from_ma20', 'pullback_from_high', 'bounce_from_low', 'intraday_trend', 'spot_futures_proxy']
+    micro_cols = ['ret', 'rsi', 'rsi_fast', 'body_length', 'upper_shadow', 'lower_shadow', 'body_avg_5', 'momentum_explosion', 'vol_surge_ratio', 'pv_divergence', 'noise_wavelet', 'vol_range_ratio', 'obv_bias', 'obv_slope']
+
+    # 過濾有效特徵
+    macro_cols = [c for c in macro_cols if c in valid_cols]
+    meso_cols = [c for c in meso_cols if c in valid_cols]
+    micro_cols = [c for c in micro_cols if c in valid_cols]
+
     # 必須與 train_model.py 的參數一致
-    ai_model = MultiTimeframeCompositeAI(input_dim=input_dim, d_model=256, nhead=8, num_layers=3)
+    ai_model = TriCoreMarketEngine(
+        macro_dim=len(macro_cols),
+        meso_dim=len(meso_cols),
+        micro_dim=len(micro_cols),
+        d_model=128, nhead=8, num_layers=2
+    )
     model_manager = TradingModelManager(model_dir=os.path.join(os.path.dirname(__file__), "saved_models"))
 
     ai_model, _, current_version = model_manager.load_latest_model(ai_model)
@@ -140,6 +161,10 @@ def run_advanced_simulator(initial_capital=100000, days=5):
 
     print(f"\n📊 啟動【選擇權實務模式】AI 突破推理 & 交易波段自動繪圖模擬器")
     print(f"💵 初始本金: NT$ {initial_capital:,} | 選擇權乘數: {CONTRACT_MULTIPLIER}")
+
+    import datetime
+    today_str = datetime.datetime.now().strftime('%Y%m%d')
+    version_str = current_version if current_version else "vUnknown"
 
     # 控制是否要儲存交易圖表，設為 True 會大幅拖慢回測速度 (若交易次數破千)
     SAVE_PLOTS = False
@@ -174,28 +199,39 @@ def run_advanced_simulator(initial_capital=100000, days=5):
         next_row = df.iloc[i+1]
         curr_time = last_row['date'].time()
 
-        # --- Multi-Timeframe (MTF) AI 推理 ---
-        # 1. 1分鐘分支 (40 根)
-        feat_data_1m = curr_slice[norm_params['feature_cols']].tail(40).values
-        feat_normalized_1m = (feat_data_1m - mean_v) / std_v
-        feat_tensor_1m = torch.tensor(feat_normalized_1m, dtype=torch.float32).unsqueeze(0).to(device)
-
-        # 2. 15分鐘分支 (20 根)
-        # 利用現有數據重採樣出 15 分鐘線
-        df_15m_base = curr_slice.set_index('date').resample('15min').last().ffill()
-        feat_data_15m = df_15m_base[norm_params['feature_cols']].tail(20).values
+        # --- Tri-Core AI 推理 ---
+        win_meso = 15
+        win_micro = 10
+        needed_bars = max(win_meso, win_micro)
         
-        # 檢查是否具備足夠的 15m 歷史數據以滿足位置編碼長度 (20)
-        if len(feat_data_15m) < 20:
-            probs = np.zeros(7)
-            probs[3] = 1.0 # 預設中立
+        if len(curr_slice) < needed_bars:
+            probs = np.zeros(5)
+            probs[2] = 1.0 # 預設震盪
         else:
-            feat_normalized_15m = (feat_data_15m - mean_v) / std_v
-            feat_tensor_15m = torch.tensor(feat_normalized_15m, dtype=torch.float32).unsqueeze(0).to(device)
+            recent_slice = curr_slice.tail(needed_bars)
+            
+            # 使用 pd.Series 廣播計算
+            mean_series = pd.Series(norm_params['mean'])
+            std_series = pd.Series(norm_params['std'])
+            
+            recent_norm = (recent_slice[valid_cols] - mean_series[valid_cols]) / std_series[valid_cols]
+            recent_norm = recent_norm.clip(-10, 10).fillna(0)
+
+            mac_val = recent_norm[macro_cols].iloc[-1].values
+            mes_val = recent_norm[meso_cols].tail(win_meso).values
+            mic_val = recent_norm[micro_cols].tail(win_micro).values
+            reg_val = recent_slice['regime_id'].iloc[-1]
+            atr_val = recent_slice['atr'].iloc[-1]
+
+            t_mac = torch.tensor(mac_val, dtype=torch.float32).unsqueeze(0).to(device)
+            t_reg = torch.tensor([reg_val], dtype=torch.long).to(device)
+            t_mes = torch.tensor(mes_val, dtype=torch.float32).unsqueeze(0).to(device)
+            t_mic = torch.tensor(mic_val, dtype=torch.float32).unsqueeze(0).to(device)
+            t_atr = torch.tensor([atr_val], dtype=torch.float32).to(device)
 
             with torch.no_grad():
-                logits = ai_model(feat_tensor_1m, feat_tensor_15m)
-                probs = torch.softmax(logits, dim=1).squeeze().cpu().numpy()
+                out_main, _, _ = ai_model(t_mac, t_reg, t_mes, t_mic, t_atr)
+                probs = torch.softmax(out_main, dim=1).squeeze().cpu().numpy()
 
         # 1. 平倉邏輯
         if position != 0:
@@ -274,7 +310,7 @@ def run_advanced_simulator(initial_capital=100000, days=5):
                 last_trade_win = pnl > 0
 
                 trade_log.append({'date': next_row['date'], 'type': exit_reason, 'ret': net_ret, 'capital': current_capital, 'entry_features': current_entry_features})
-                save_trade_plot(df, entry_idx, i+1, exit_reason, net_ret, len(trade_log), current_entry_features, trade_capital_used, position)
+                save_trade_plot(df, entry_idx, i+1, exit_reason, net_ret, len(trade_log), current_entry_features, trade_capital_used, position, version_str, today_str)
 
                 position = 0
                 is_scalp = False
@@ -355,7 +391,7 @@ def run_advanced_simulator(initial_capital=100000, days=5):
                 'prob_up': probs[2]
             }
             # 儲存 AI 所看到的所有特徵
-            for col in norm_params['feature_cols']:
+            for col in valid_cols:
                 current_entry_features[col] = last_row[col]
 
     # 結算與報告
@@ -388,7 +424,7 @@ def run_advanced_simulator(initial_capital=100000, days=5):
         loss_trades = df_features[df_features['ret'] <= 0]
         if not win_trades.empty and not loss_trades.empty:
             analysis_lines = []
-            for col in norm_params['feature_cols']:
+            for col in valid_cols:
                 if col in df_features.columns:
                     win_mean = win_trades[col].mean()
                     loss_mean = loss_trades[col].mean()
@@ -484,11 +520,13 @@ def run_advanced_simulator(initial_capital=100000, days=5):
     print(f"\n✅ 回測完成！交易波段圖已儲存至 data_learn/trade_plots/")
 
     if avg_weekly_ret > 0:
-        model_manager.save_model(ai_model, optimizer, {"avg_weekly_ret": avg_weekly_ret}, {"leverage": LEVERAGE})
+        model_manager.save_model(ai_model, None, {"avg_weekly_ret": avg_weekly_ret}, {"leverage": LEVERAGE})
+
+    filename = f"equity_curve_{version_str}_{today_str}.png"
 
     plt.figure(figsize=(12, 6))
     plt.plot(capital_curve)
-    plt.savefig(os.path.join(os.path.dirname(__file__), "data_learn", "equity_curve.png"))
+    plt.savefig(os.path.join(os.path.dirname(__file__), "data_learn", filename))
 
 if __name__ == "__main__":
     run_advanced_simulator(initial_capital=120000, days=120)
