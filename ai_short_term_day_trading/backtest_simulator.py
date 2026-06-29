@@ -8,9 +8,9 @@ import matplotlib as mpl
 plt.rcParams['font.sans-serif'] = ['Microsoft JhengHei', 'SimHei', 'Arial'] # 優先使用微軟正黑體
 plt.rcParams['axes.unicode_minus'] = False # 正常顯示負號
 import torch
-from data_engine import DayTradingDataEngine
+from mtf_data_engine import MTFDayTradingDataEngine
 from strategy_factory import StrategyFactory
-from composite_ai import TriCoreMarketEngine
+from hexa_core_ai import HexaCoreMarketEngine
 from model_manager import TradingModelManager
 from delta_gamma_theta import calculate_bs_greeks, get_dynamic_bsm_bounds
 
@@ -91,8 +91,8 @@ def save_trade_plot(df, entry_idx, exit_idx, trade_type, ret, trade_id, entry_fe
     except Exception as e:
         print(f"Plot saving failed: {e}")
 
-def run_advanced_simulator(initial_capital=100000, days=5):
-    engine = DayTradingDataEngine()
+def run_advanced_simulator(initial_capital=100000, days=120):
+    engine = MTFDayTradingDataEngine()
     df_raw = engine.fetch_intraday_data(days=days)
     df_chips = engine.fetch_real_historical_chips(days=days + 15)
 
@@ -101,6 +101,12 @@ def run_advanced_simulator(initial_capital=100000, days=5):
         return
 
     df = engine.integrate_institutional_chips(df_raw, df_chips)
+    df = engine.process_mtf_features(df)
+    
+    # 限制回測資料量避免 VRAM OOM
+    bars_needed = int(days * 300) + 135
+    if len(df) > bars_needed:
+        df = df.tail(bars_needed).reset_index(drop=True)
 
     if df.empty:
         print("融合後沒有數據。")
@@ -123,22 +129,22 @@ def run_advanced_simulator(initial_capital=100000, days=5):
         feature_cols = [c for c in df.columns if c not in ['date', 'time', 'date_only', 'day_of_week', 'date_x', 'date_y']]
         input_dim = len(feature_cols)
 
-    # 定義 Tri-Core 特徵分流
-    macro_cols = ['nasdaq_prev_ret', 'nikkei_premarket_momentum', 'pc_ratio', 'us_tw_gap_divergence', 'settlement_type', 'is_settlement_day', 'dte', 'gap_amplitude', 'gap_filled', 'time_sin', 'time_cos']
-    meso_cols = ['macd_hist', 'vwap_bias', 'bb_width', 'is_squeeze', 'slope_vwap', 'slope_ma20', 'dist_from_ma20', 'pullback_from_high', 'bounce_from_low', 'intraday_trend', 'spot_futures_proxy']
-    micro_cols = ['ret', 'rsi', 'rsi_fast', 'body_length', 'upper_shadow', 'lower_shadow', 'body_avg_5', 'momentum_explosion', 'vol_surge_ratio', 'pv_divergence', 'noise_wavelet', 'vol_range_ratio', 'obv_bias', 'obv_slope']
+    # 定義 Hexa-Core 特徵分流
+    mac_cols = ['nasdaq_prev_ret', 'nikkei_premarket_momentum', 'pc_ratio', 'us_tw_gap_divergence', 'settlement_type', 'is_settlement_day', 'dte', 'gap_amplitude', 'time_sin', 'time_cos']
+    mes_cols = ['macd_hist', 'macd', 'rsi', 'rsi_fast', 'intraday_trend', 'dist_from_ma20', 'pullback_from_high', 'bounce_from_low', 'is_squeeze', 'slope_vwap', 'slope_ma20', 'spot_futures_proxy']
+    mic_cols = ['ret', 'tr', 'body_length', 'upper_shadow', 'lower_shadow', 'momentum_explosion', 'vol_surge_ratio', 'pv_divergence', 'obv_bias', 'obv_slope', 'gap_filled', 'noise_wavelet', 'vol_range_ratio', 'orderbook_imbalance', 'volume_delta', 'cvd_bias']
 
-    # 過濾有效特徵
-    macro_cols = [c for c in macro_cols if c in valid_cols]
-    meso_cols = [c for c in meso_cols if c in valid_cols]
-    micro_cols = [c for c in micro_cols if c in valid_cols]
+    mac_c = [c for c in mac_cols if c in df.columns]
+    m30_c = [f'30m_{c}' for c in mes_cols if f'30m_{c}' in df.columns]
+    m15_c = [f'15m_{c}' for c in mes_cols if f'15m_{c}' in df.columns]
+    mi3_c = [f'3m_{c}' for c in mic_cols if f'3m_{c}' in df.columns]
+    mi1_c = [f'1m_{c}' for c in mic_cols if f'1m_{c}' in df.columns]
 
-    # 必須與 train_model.py 的參數一致
-    ai_model = TriCoreMarketEngine(
-        macro_dim=len(macro_cols),
-        meso_dim=len(meso_cols),
-        micro_dim=len(micro_cols),
-        d_model=128, nhead=8, num_layers=2
+    # 必須與 train.py 的參數一致
+    ai_model = HexaCoreMarketEngine(
+        macro_dim=len(mac_c), meso_dim=len(m30_c), micro_dim=len(mi3_c),
+        d_model=128, nhead=8, num_layers=2,
+        seq_len_30m=5, seq_len_15m=10, seq_len_3m=3, seq_len_1m=9, num_classes=5
     )
     model_manager = TradingModelManager(model_dir=os.path.join(os.path.dirname(__file__), "saved_models"))
 
@@ -159,6 +165,63 @@ def run_advanced_simulator(initial_capital=100000, days=5):
     def get_dynamic_cost(num_contracts):
         return num_contracts * FEE_SLIPPAGE_PER_CONTRACT
 
+    print(f"\n🧠 啟動【Hexa-Core 向量化預測】生成全域機率張量...")
+    
+    # 向量化特徵正規化
+    df_norm = df.copy()
+    if os.path.exists(norm_path):
+        for c in valid_cols:
+            df_norm[c] = (df[c] - norm_params['mean'][c]) / norm_params['std'][c]
+            
+    df_norm = df_norm.fillna(0)
+    
+    data_mac = df_norm[mac_c].values
+    data_30m = df_norm[m30_c].values
+    data_15m = df_norm[m15_c].values
+    data_3m = df_norm[mi3_c].values
+    data_1m = df_norm[mi1_c].values
+    data_atr = df['atr'].fillna(10.0).values
+    data_regime = df['regime_id'].fillna(7).astype(int).values
+
+    X_mac, X_30m, X_15m, X_3m, X_1m, Regimes, ATRs = [], [], [], [], [], [], []
+    arr_30m = np.array([120, 60, 15, 5, 0])
+    arr_15m = np.array([135, 90, 45, 30, 20, 15, 10, 5, 2, 0])
+    arr_3m = np.array([6, 3, 0])
+    arr_1m = np.arange(8, -1, -1)
+    
+    START_OFFSET = 135
+    for i in range(START_OFFSET, len(df_norm)):
+        X_mac.append(data_mac[i])
+        Regimes.append(data_regime[i])
+        ATRs.append(data_atr[i])
+        X_30m.append(data_30m[i - arr_30m])
+        X_15m.append(data_15m[i - arr_15m])
+        X_3m.append(data_3m[i - arr_3m])
+        X_1m.append(data_1m[i - arr_1m])
+        
+    t_mac = torch.tensor(np.array(X_mac), dtype=torch.float32).to(device)
+    t_reg = torch.tensor(np.array(Regimes), dtype=torch.long).to(device)
+    t_30m = torch.tensor(np.array(X_30m), dtype=torch.float32).to(device)
+    t_15m = torch.tensor(np.array(X_15m), dtype=torch.float32).to(device)
+    t_3m = torch.tensor(np.array(X_3m), dtype=torch.float32).to(device)
+    t_1m = torch.tensor(np.array(X_1m), dtype=torch.float32).to(device)
+    t_atr = torch.tensor(np.array(ATRs), dtype=torch.float32).to(device)
+    
+    # 批次切片預測避免 VRAM OOM
+    batch_size = 2048
+    all_probs_list = []
+    with torch.no_grad():
+        for b in range(0, len(t_mac), batch_size):
+            out_main, _, _, _, _ = ai_model(
+                t_mac[b:b+batch_size], t_reg[b:b+batch_size],
+                t_30m[b:b+batch_size], t_15m[b:b+batch_size],
+                t_3m[b:b+batch_size], t_1m[b:b+batch_size],
+                t_atr[b:b+batch_size]
+            )
+            all_probs_list.append(torch.softmax(out_main, dim=1).cpu().numpy())
+    all_probs = np.concatenate(all_probs_list, axis=0)
+    print(f"✅ 全域機率張量預測完成！(總筆數: {len(all_probs)})")
+    
     print(f"\n📊 啟動【選擇權實務模式】AI 突破推理 & 交易波段自動繪圖模擬器")
     print(f"💵 初始本金: NT$ {initial_capital:,} | 選擇權乘數: {CONTRACT_MULTIPLIER}")
 
@@ -180,7 +243,7 @@ def run_advanced_simulator(initial_capital=100000, days=5):
     capital_curve = [initial_capital]
     trade_capital_used = 0
     num_contracts = 0
-    WINDOW_SIZE = 40
+    START_OFFSET = 135
 
     # 連續波段與追蹤停損變數
     last_trade_win = False
@@ -190,7 +253,7 @@ def run_advanced_simulator(initial_capital=100000, days=5):
     hard_sl_price = 0.0
 
     total_bars = len(df)
-    for i in range(WINDOW_SIZE, total_bars-1):
+    for i in range(START_OFFSET, total_bars-1):
         if i % 2000 == 0:
             print(f"⏳ 回測進度: {i} / {total_bars} ({i/total_bars*100:.1f}%) | 當前本金: {current_capital:,.0f}")
 
@@ -199,39 +262,12 @@ def run_advanced_simulator(initial_capital=100000, days=5):
         next_row = df.iloc[i+1]
         curr_time = last_row['date'].time()
 
-        # --- Tri-Core AI 推理 ---
-        win_meso = 15
-        win_micro = 10
-        needed_bars = max(win_meso, win_micro)
-        
-        if len(curr_slice) < needed_bars:
+        # --- Hexa-Core AI 向量化機率查表 ---
+        if i < START_OFFSET:
             probs = np.zeros(5)
-            probs[2] = 1.0 # 預設震盪
+            probs[2] = 1.0 # 預設盤整 (index 2)
         else:
-            recent_slice = curr_slice.tail(needed_bars)
-            
-            # 使用 pd.Series 廣播計算
-            mean_series = pd.Series(norm_params['mean'])
-            std_series = pd.Series(norm_params['std'])
-            
-            recent_norm = (recent_slice[valid_cols] - mean_series[valid_cols]) / std_series[valid_cols]
-            recent_norm = recent_norm.clip(-10, 10).fillna(0)
-
-            mac_val = recent_norm[macro_cols].iloc[-1].values
-            mes_val = recent_norm[meso_cols].tail(win_meso).values
-            mic_val = recent_norm[micro_cols].tail(win_micro).values
-            reg_val = recent_slice['regime_id'].iloc[-1]
-            atr_val = recent_slice['atr'].iloc[-1]
-
-            t_mac = torch.tensor(mac_val, dtype=torch.float32).unsqueeze(0).to(device)
-            t_reg = torch.tensor([reg_val], dtype=torch.long).to(device)
-            t_mes = torch.tensor(mes_val, dtype=torch.float32).unsqueeze(0).to(device)
-            t_mic = torch.tensor(mic_val, dtype=torch.float32).unsqueeze(0).to(device)
-            t_atr = torch.tensor([atr_val], dtype=torch.float32).to(device)
-
-            with torch.no_grad():
-                out_main, _, _ = ai_model(t_mac, t_reg, t_mes, t_mic, t_atr)
-                probs = torch.softmax(out_main, dim=1).squeeze().cpu().numpy()
+            probs = all_probs[i - START_OFFSET]
 
         # 1. 平倉邏輯
         if position != 0:
@@ -243,10 +279,15 @@ def run_advanced_simulator(initial_capital=100000, days=5):
             T = current_entry_features['T']
             opt_type = current_entry_features['opt_type']
 
-            # 使用 BSM 轉換最高最低指數價為權利金 (這是一種粗估，實務上還要考慮動態時間與波動率)
-            _, _, _, opt_price_at_high = calculate_bs_greeks(S_high, K, T, 0.015, 0.22, opt_type)
-            _, _, _, opt_price_at_low = calculate_bs_greeks(S_low, K, T, 0.015, 0.22, opt_type)
-            _, _, _, opt_price_close = calculate_bs_greeks(S_close, K, T, 0.015, 0.22, opt_type)
+            # [真實動態模擬] 平倉時也要考慮動態 IV
+            exit_vol_surge = min(max(last_row.get('vol_surge_ratio', 1.0), 1.0), 4.0)
+            base_exit_iv = 0.22
+            exit_iv = base_exit_iv + (exit_vol_surge * 0.02) if opt_type == 'Put' else base_exit_iv + (exit_vol_surge * 0.005)
+
+            # 使用 BSM 轉換最高最低指數價為權利金 (考量動態 IV)
+            _, _, _, opt_price_at_high = calculate_bs_greeks(S_high, K, T, 0.015, exit_iv, opt_type)
+            _, _, _, opt_price_at_low = calculate_bs_greeks(S_low, K, T, 0.015, exit_iv, opt_type)
+            _, _, _, opt_price_close = calculate_bs_greeks(S_close, K, T, 0.015, exit_iv, opt_type)
 
             # 對 Call 而言，指數越高選擇權越高；對 Put 而言，指數越低選擇權越高
             if position == 1:
@@ -276,11 +317,11 @@ def run_advanced_simulator(initial_capital=100000, days=5):
                     exec_price = opt_price_close
                     is_scalp = False
 
-            # === 波段/常規出場邏輯 ===
+            # === 當沖強制作業邏輯 (No Overnight) ===
             if not exit_reason:
-                is_next_day = next_row['date_only'] > current_entry_features['entry_date'].date()
-                if is_next_day and curr_time.hour == 13 and curr_time.minute >= 25:
-                    exit_reason = 'Close_Next_Day_EOD'
+                # 絕不留倉，若時間達到 13:30，強制市價平倉
+                if curr_time.hour == 13 and curr_time.minute >= 30:
+                    exit_reason = 'Close_Intraday_EOD'
                     exec_price = opt_price_close
 
             if not exit_reason:
@@ -303,7 +344,11 @@ def run_advanced_simulator(initial_capital=100000, days=5):
                     exec_price = hard_tp_price
 
             if exit_reason:
-                points_gained = exec_price - entry_price # 選擇權不分多空，獲利就是賣價減買價
+                # [真實動態模擬] 平倉滑價：緊急停損時滑價大，正常停利時滑價小
+                exit_slippage = 3.0 if exit_reason == 'Stop_Loss' else 1.0
+                actual_exec_price = max(exec_price - exit_slippage, 0.1) # 賣出時價格被壓低
+                
+                points_gained = actual_exec_price - entry_price # 選擇權不分多空，獲利就是賣價減買價
                 pnl = (points_gained * CONTRACT_MULTIPLIER * num_contracts) - get_dynamic_cost(num_contracts)
                 net_ret = pnl / trade_capital_used if trade_capital_used > 0 else 0
                 current_capital += pnl
@@ -322,9 +367,9 @@ def run_advanced_simulator(initial_capital=100000, days=5):
         # 2. 進場邏輯
         signal = strategy_engine.generate_signal(curr_slice, ai_score=probs, last_win=last_trade_win)
         
-        # 僅限日盤交易 (08:45 ~ 13:45)
+        # 僅限日盤交易且預留時間給當沖平倉 (08:45 ~ 13:15)
         import datetime
-        is_day_session = (datetime.time(8, 45) <= curr_time <= datetime.time(13, 45))
+        is_day_session = (datetime.time(8, 45) <= curr_time <= datetime.time(13, 15))
         
         if signal != 0 and position == 0 and is_day_session:
             is_scalp = (abs(signal) == 10)
@@ -334,17 +379,29 @@ def run_advanced_simulator(initial_capital=100000, days=5):
             S = next_row['Open']
             K = round(S / 50) * 50 # 取最接近的價平履約價
             T = 7 / 365.0 # 假設為近週選
-            iv = 0.22
             opt_type = 'Call' if position == 1 else 'Put'
+            
+            # [真實動態模擬] 根據大盤爆量與波動程度，動態膨脹 IV (引發選擇權權利金暴漲)
+            vol_surge_factor = min(max(last_row.get('vol_surge_ratio', 1.0), 1.0), 4.0)
+            base_iv = 0.22
+            if opt_type == 'Put':
+                # 跌勢恐慌時 Put IV 狂飆 (Volatility Skew)
+                iv = base_iv + (vol_surge_factor * 0.02)
+            else:
+                iv = base_iv + (vol_surge_factor * 0.005)
 
             _, _, _, simulated_entry_price = calculate_bs_greeks(S, K, T, 0.015, iv, opt_type)
+
+            # [真實動態模擬] 模擬進場滑價與試探成本 (高波動時買賣價差會被拉開)
+            # 在爆量瞬間，通常會買在相對高點 (Slippage 懲罰: 1 ~ 6 點)
+            dynamic_slippage = min(vol_surge_factor * 1.5, 6.0)
 
             # 若計算出權利金小於 5 點，代表太過價外或模型偏差，強制棄單
             if simulated_entry_price < 5:
                 position = 0
                 continue
 
-            entry_price = simulated_entry_price
+            entry_price = simulated_entry_price + dynamic_slippage
             entry_idx = i + 1
             highest_price_since_entry = entry_price
 
@@ -386,9 +443,11 @@ def run_advanced_simulator(initial_capital=100000, days=5):
                 'opt_type': opt_type,
                 'K': K,
                 'T': T,
-                'prob_down': probs[0],
-                'prob_neutral': probs[1],
-                'prob_up': probs[2]
+                'prob_strong_down': probs[0],
+                'prob_med_down': probs[1],
+                'prob_neutral': probs[2],
+                'prob_med_up': probs[3],
+                'prob_strong_up': probs[4]
             }
             # 儲存 AI 所看到的所有特徵
             for col in valid_cols:
@@ -529,4 +588,4 @@ def run_advanced_simulator(initial_capital=100000, days=5):
     plt.savefig(os.path.join(os.path.dirname(__file__), "data_learn", filename))
 
 if __name__ == "__main__":
-    run_advanced_simulator(initial_capital=120000, days=120)
+    run_advanced_simulator(initial_capital=120000, days=90)
